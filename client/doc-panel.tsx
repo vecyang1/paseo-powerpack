@@ -307,6 +307,7 @@ function DocumentViewportSlot({
       compareMeta: {
         color: theme.colors.foregroundMuted,
         fontSize: 11,
+        flexShrink: 1,
       },
       miniBtn: {
         flexDirection: "row" as const,
@@ -466,7 +467,7 @@ function DocumentViewportSlot({
           <Text style={slotStyles.compareTitle} numberOfLines={1}>
             {data.fileName}
           </Text>
-          <Text style={slotStyles.compareMeta}>
+          <Text style={slotStyles.compareMeta} numberOfLines={1} ellipsizeMode="tail">
             {data.extension.toUpperCase()} · {data.totalPages}p · {data.sizeFormatted}
           </Text>
           {onOpenInTab ? (
