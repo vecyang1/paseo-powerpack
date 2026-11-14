@@ -76,9 +76,10 @@ async function run(page: Page, shots: string[]): Promise<void> {
     const projRows = Array.from(
       document.querySelectorAll<HTMLElement>('[data-testid^="sidebar-project-row-"]'),
     );
-    const coworkProj = projRows.find((r) => /Antigravity Cowork/i.test(r.textContent || ""));
-    if (coworkProj) {
-      coworkProj.click();
+    const projectPattern = new RegExp(process.env.PASEO_E2E_PROJECT_PATTERN || "A-coding|Example", "i");
+    const targetProj = projRows.find((r) => projectPattern.test(r.textContent || ""));
+    if (targetProj) {
+      targetProj.click();
     }
   }, WORKSPACE_ID);
   await sleep(600);
