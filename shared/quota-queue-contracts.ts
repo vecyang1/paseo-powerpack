@@ -5,6 +5,10 @@ export const QUOTA_QUEUE_STORAGE_VERSION = 1;
 export const QUOTA_QUEUE_CLIENT_LEASE_TTL_MS = 90_000;
 export const QUOTA_QUEUE_DEFAULT_COOLDOWN_FLOOR_MS = 900_000;
 export const QUOTA_QUEUE_SERIAL_SETTLE_MS = 1_200;
+// Ids of queued messages already sent, by either drainer (desktop guard or headless
+// `antigravity-ops paseo-recovery`). Kept a day so a stale snapshot cannot resend them.
+export const QUOTA_QUEUE_DRAINED_LEDGER_TTL_MS = 24 * 3_600_000;
+export const QUOTA_QUEUE_DRAINED_LEDGER_MAX_PER_AGENT = 50;
 
 export const QuotaErrorSignalPatterns: readonly RegExp[] = [
   /all accounts rate-limited/i,
@@ -431,7 +435,37 @@ export const QuotaQueueReceiptSchema = z.object({
   action: z.enum(["held", "checked", "drained", "pulled_previous", "released", "restored"]),
   queuedCount: z.number(),
   detail: z.string(),
+  messageIds: z.array(z.string()).optional(),
 });
+
+export const QuotaQueueDrainedEntrySchema = z.object({
+  id: z.string(),
+  at: z.string(),
+  by: z.string().default(""),
+});
+
+export type QuotaQueueDrainedEntry = z.infer<typeof QuotaQueueDrainedEntrySchema>;
+
+/** Drop ledger entries past the TTL and cap each agent's list (newest first). */
+export function pruneDrainedLedger(
+  ledger: Record<string, QuotaQueueDrainedEntry[]> | undefined,
+  nowMs: number,
+): Record<string, QuotaQueueDrainedEntry[]> {
+  const out: Record<string, QuotaQueueDrainedEntry[]> = {};
+  for (const [agentId, entries] of Object.entries(ledger ?? {})) {
+    if (!Array.isArray(entries)) continue;
+    const kept = entries
+      .filter((e) => e && typeof e.id === "string" && e.id)
+      .filter((e) => {
+        const at = Date.parse(String(e.at ?? ""));
+        return Number.isFinite(at) && nowMs - at < QUOTA_QUEUE_DRAINED_LEDGER_TTL_MS;
+      })
+      .sort((a, b) => b.at.localeCompare(a.at))
+      .slice(0, QUOTA_QUEUE_DRAINED_LEDGER_MAX_PER_AGENT);
+    if (kept.length > 0) out[agentId] = kept;
+  }
+  return out;
+}
 
 export type QuotaQueueReceipt = z.infer<typeof QuotaQueueReceiptSchema>;
 
@@ -452,6 +486,7 @@ export const manageQuotaQueueRpc = defineRpc({
     lastErrorText: z.string().nullable().optional(),
     resumeAtMs: z.number().nullable().optional(),
     queuedMessages: z.array(QuotaQueueItemSchema).optional(),
+    dispatchedMessageIds: z.array(z.string()).optional(),
     triggerRecoveryIfReady: z.boolean().optional(),
     source: z
       .enum(["runtime-guard", "settings-ui", "slash-command", "command-center", "agent-tool"])
@@ -470,6 +505,7 @@ export const manageQuotaQueueRpc = defineRpc({
     holdReason: z.string(),
     entries: z.array(QuotaQueueAgentEntrySchema),
     receipts: z.array(QuotaQueueReceiptSchema),
+    drainedMessageIds: z.array(z.string()).optional(),
     message: z.string(),
     durationMs: z.number(),
   }),

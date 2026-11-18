@@ -1,11 +1,14 @@
 import type { RpcInput } from "@getpaseo/plugin";
 import { execCommand, type PluginHandlerContext } from "@getpaseo/plugin/server";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
   QUOTA_QUEUE_STORAGE_VERSION,
+  pruneDrainedLedger,
   type QuotaQueueAgentEntry,
+  type QuotaQueueDrainedEntry,
   type QuotaQueueItem,
   type QuotaQueueReceipt,
   type manageQuotaQueueRpc,
@@ -25,6 +28,8 @@ export interface PersistedQuotaQueueStore {
   version: number;
   agents: Record<string, QuotaQueueAgentEntry>;
   receipts: QuotaQueueReceipt[];
+  /** Ids already sent per agent, shared with the headless drainer in `antigravity_account_ops.py`. */
+  drainedMessages?: Record<string, QuotaQueueDrainedEntry[]>;
 }
 
 export interface QuotaQueueHandlerDeps {
@@ -63,10 +68,21 @@ export async function readQuotaQueueStore(stateFile: string): Promise<PersistedQ
       }
     }
     const receipts = Array.isArray(parsed.receipts) ? parsed.receipts.slice(0, MAX_RECEIPTS) : [];
-    return { version: QUOTA_QUEUE_STORAGE_VERSION, agents, receipts };
+    const drainedMessages =
+      parsed.drainedMessages && typeof parsed.drainedMessages === "object" ? parsed.drainedMessages : {};
+    return { version: QUOTA_QUEUE_STORAGE_VERSION, agents, receipts, drainedMessages };
   } catch {
     return { version: QUOTA_QUEUE_STORAGE_VERSION, agents: {}, receipts: [] };
   }
+}
+
+const stateFileQueue = new Map<string, Promise<unknown>>();
+
+function serializeStateFileOp<T>(stateFile: string, fn: () => Promise<T>): Promise<T> {
+  const prev = stateFileQueue.get(stateFile) ?? Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  stateFileQueue.set(stateFile, next);
+  return next;
 }
 
 export async function writeQuotaQueueStore(
@@ -74,18 +90,39 @@ export async function writeQuotaQueueStore(
   store: PersistedQuotaQueueStore,
 ): Promise<void> {
   await fs.mkdir(path.dirname(stateFile), { recursive: true });
-  const tmp = `${stateFile}.tmp-${process.pid}-${Date.now()}`;
+  const tmp = `${stateFile}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
   const payload = JSON.stringify(
     {
       version: QUOTA_QUEUE_STORAGE_VERSION,
       agents: store.agents,
       receipts: store.receipts.slice(0, MAX_RECEIPTS),
+      drainedMessages: store.drainedMessages ?? {},
     },
     null,
     2,
   );
   await fs.writeFile(tmp, payload + "\n", "utf8");
   await fs.rename(tmp, stateFile);
+}
+
+function recordDrained(
+  store: PersistedQuotaQueueStore,
+  agentId: string,
+  ids: readonly string[],
+  at: string,
+  by: string,
+): boolean {
+  const ledger = (store.drainedMessages ??= {});
+  const list = ledger[agentId] ?? [];
+  const known = new Set(list.map((e) => e.id));
+  const fresh = ids.filter((id) => id && !known.has(id)).map((id) => ({ id, at, by }));
+  if (fresh.length === 0) return false;
+  ledger[agentId] = [...fresh, ...list];
+  return true;
+}
+
+function drainedIdsFor(store: PersistedQuotaQueueStore, agentId: string): Set<string> {
+  return new Set((store.drainedMessages?.[agentId] ?? []).map((e) => e.id));
 }
 
 function appendReceipt(
@@ -196,8 +233,10 @@ async function probeAgentRecoveryState(
     (cls === "INTERRUPTED_NEEDS_PULLUP" ||
       (cls === "QUOTA_COOLDOWN_DEFERRED" &&
         (qcd?.deferred === false ||
+          qcd?.earlyRecovered === true ||
           (typeof qcd?.remainingSecs === "number" && qcd.remainingSecs <= 0) ||
-          reason.includes("运行 heal 将自动探针确认"))) ||
+          reason.includes("运行 heal 将自动探针确认") ||
+          (bypassCache && reason.includes("等待冷却探测")))) ||
       cls === "CREDIT_BLOCKED")
   ) {
     const healedParsed = await runOps("heal");
@@ -274,13 +313,26 @@ export async function handleManageQuotaQueue(
   _context?: PluginHandlerContext,
   deps: QuotaQueueHandlerDeps = {},
 ) {
+  const stateFile = deps.stateFile ?? defaultQuotaQueueStatePath();
+  return serializeStateFileOp(stateFile, () => handleManageQuotaQueueUnlocked(input, _context, deps, stateFile));
+}
+
+async function handleManageQuotaQueueUnlocked(
+  input: RpcInput<typeof manageQuotaQueueRpc>,
+  _context: PluginHandlerContext | undefined,
+  deps: QuotaQueueHandlerDeps,
+  stateFile: string,
+) {
   const startMs = Date.now();
   const nowMs = deps.nowFn ? deps.nowFn() : Date.now();
   const nowIso = new Date(nowMs).toISOString();
-  const stateFile = deps.stateFile ?? defaultQuotaQueueStatePath();
   const action = input.action ?? "status";
   const agentId = (input.agentId ?? "").trim();
   const store = await readQuotaQueueStore(stateFile);
+  const ledgerBefore = JSON.stringify(store.drainedMessages ?? {});
+  store.drainedMessages = pruneDrainedLedger(store.drainedMessages, nowMs);
+  let ledgerDirty = JSON.stringify(store.drainedMessages) !== ledgerBefore;
+  let drainedMessageIds: string[] = [];
 
   let readyToDrain = false;
   let quotaRefreshed: boolean | null = null;
@@ -326,11 +378,19 @@ export async function handleManageQuotaQueue(
     previousTurnCompleted = true;
     message = `Released queue hold for agent ${agentId.slice(0, 8)}`;
   } else if (action === "sync" && agentId) {
-    const queued: QuotaQueueItem[] = (input.queuedMessages ?? []).map((q) => ({
-      id: q.id,
-      text: q.text,
-      attachments: Array.isArray(q.attachments) ? q.attachments : [],
-    }));
+    if (recordDrained(store, agentId, input.dispatchedMessageIds ?? [], nowIso, "desktop")) {
+      ledgerDirty = true;
+    }
+    const alreadySent = drainedIdsFor(store, agentId);
+    const incoming = input.queuedMessages ?? [];
+    drainedMessageIds = incoming.filter((q) => alreadySent.has(q.id)).map((q) => q.id);
+    const queued: QuotaQueueItem[] = incoming
+      .filter((q) => !alreadySent.has(q.id))
+      .map((q) => ({
+        id: q.id,
+        text: q.text,
+        attachments: Array.isArray(q.attachments) ? q.attachments : [],
+      }));
     const prev = store.agents[agentId];
     const nextResumeIso =
       typeof input.resumeAtMs === "number" && Number.isFinite(input.resumeAtMs)
@@ -338,9 +398,10 @@ export async function handleManageQuotaQueue(
         : (prev?.resumeAtIso ?? null);
 
     if (queued.length === 0 && !input.held) {
-      if (prev) {
+      if (prev || ledgerDirty) {
         delete store.agents[agentId];
         await writeQuotaQueueStore(stateFile, store);
+        ledgerDirty = false;
       }
       readyToDrain = true;
       message = `Synced empty queue for ${agentId.slice(0, 8)}`;
@@ -378,6 +439,7 @@ export async function handleManageQuotaQueue(
         });
       }
       await writeQuotaQueueStore(stateFile, store);
+      ledgerDirty = false;
       readyToDrain = !heldFlag;
       holdReason = entry.holdReason;
       resumeAtIso = entry.resumeAtIso ?? null;
@@ -396,18 +458,25 @@ export async function handleManageQuotaQueue(
     quotaRefreshed = probe.quotaRefreshed;
     previousTurnCompleted = probe.previousTurnCompleted;
     readyToDrain = probe.readyToDrain;
-    resumeAtIso = probe.resumeAtIso;
+    const existing = store.agents[agentId];
+    resumeAtIso = probe.quotaRefreshed === true ? null : (probe.resumeAtIso ?? existing?.resumeAtIso ?? null);
     holdReason = probe.holdReason;
 
-    const existing = store.agents[agentId];
     if (existing) {
+      const nextReasonCode = probe.readyToDrain
+        ? "ok"
+        : probe.quotaRefreshed === true
+          ? (probe.classification === "RUNNING_ACTIVE" ? "agent_running" : "previous_turn_incomplete")
+          : "quota_error_hold";
       store.agents[agentId] = {
         ...existing,
         held: !probe.readyToDrain,
+        reasonCode: nextReasonCode,
         quotaRefreshed: probe.quotaRefreshed,
         previousTurnCompleted: probe.previousTurnCompleted,
         readyToDrain: probe.readyToDrain,
-        resumeAtIso: probe.resumeAtIso ?? existing.resumeAtIso ?? null,
+        resumeAtIso,
+        lastErrorText: probe.quotaRefreshed === true ? null : existing.lastErrorText,
         holdReason: probe.holdReason,
         updatedAtIso: nowIso,
         lastClientHeartbeatIso:
@@ -467,6 +536,7 @@ export async function handleManageQuotaQueue(
           throw new Error((sendRes.stderr || sendRes.stdout || `paseo send exited ${exitCode}`).trim());
         }
         const remaining = existing.queuedMessages.slice(1);
+        recordDrained(store, agentId, [nextMsg.id], nowIso, "server-drain_one");
         if (remaining.length === 0) {
           delete store.agents[agentId];
         } else {
@@ -486,6 +556,7 @@ export async function handleManageQuotaQueue(
           action: "drained",
           queuedCount: remaining.length,
           detail: `Sent 1 queued message (${nextMsg.text.slice(0, 60)}); ${remaining.length} remaining`,
+          messageIds: [nextMsg.id],
         });
         await writeQuotaQueueStore(stateFile, store);
         message = `Dispatched 1 queued message to ${agentId.slice(0, 8)} (${remaining.length} remaining)`;
@@ -507,6 +578,11 @@ export async function handleManageQuotaQueue(
     message = `Quota Queue Guard: ${heldCount} held agent(s), ${totalQueued} queued message(s)`;
   }
 
+  if (ledgerDirty) {
+    // Pruning or a newly recorded id with no other write in this action.
+    await writeQuotaQueueStore(stateFile, store);
+  }
+
   const entries = Object.values(store.agents).sort((a, b) =>
     b.updatedAtIso.localeCompare(a.updatedAtIso),
   );
@@ -526,6 +602,7 @@ export async function handleManageQuotaQueue(
     holdReason,
     entries,
     receipts: store.receipts.slice(0, MAX_RECEIPTS),
+    drainedMessageIds,
     message:
       message ||
       `Quota Queue Guard: ${heldCount} held agent(s), ${totalQueuedMessages} queued message(s)`,

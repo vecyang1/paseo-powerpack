@@ -27,11 +27,21 @@ export const QUOTA_QUEUE_EVENT = "paseo-finder:quota-queue-updated";
 const GLOBAL_BRIDGE_KEY = "__paseoFinderQuotaQueue";
 const PATCH_MARKER_KEY = "__paseoFinderQuotaQueuePatch";
 const MAX_LOCAL_RECEIPTS = 20;
+// A failed native send puts the message back at the queue front and nothing retries it
+// (Paseo only drains on a turn ending). Retry with backoff, then hold visibly.
+const DEFAULT_DISPATCH_RETRY_DELAYS_MS = [3_000, 10_000, 30_000, 60_000, 120_000];
+const MAX_DISPATCH_FAILURES = 8;
+// While any queue is non-empty: refresh the server snapshot (the headless drainer only acts
+// when this heartbeat is >= 90s old) and drain queues stranded on idle/errored agents.
+const DEFAULT_HEARTBEAT_MS = 30_000;
+const STALL_GRACE_MS = 15_000;
+const DISPATCH_OUTCOME_POLL_MS = 100;
+const DISPATCH_OUTCOME_TIMEOUT_MS = 180_000;
 
 export interface QuotaQueueClientReceipt {
   at: string;
   agentId: string;
-  action: "held" | "drained_one" | "checked" | "restored" | "released";
+  action: "held" | "drained_one" | "checked" | "restored" | "released" | "dispatch_failed" | "deduped";
   queuedCount: number;
   reasonCode: string;
   detail: string;
@@ -65,10 +75,14 @@ export interface QuotaQueueRpcResult {
     held: boolean;
     reasonCode: string;
     holdReason: string;
+    quotaRefreshed?: boolean | null;
+    previousTurnCompleted?: boolean | null;
     resumeAtIso?: string | null;
     lastErrorText?: string | null;
     queuedMessages: QuotaQueueItem[];
   }>;
+  /** Ids the server ledger says were already sent (by any drainer); drop them locally. */
+  drainedMessageIds?: string[];
 }
 
 export type QuotaQueueRpcCaller = (input: {
@@ -84,6 +98,7 @@ export type QuotaQueueRpcCaller = (input: {
   lastErrorText?: string | null;
   resumeAtMs?: number | null;
   queuedMessages?: QuotaQueueItem[];
+  dispatchedMessageIds?: string[];
   triggerRecoveryIfReady?: boolean;
   source?: "runtime-guard" | "settings-ui" | "slash-command" | "command-center" | "agent-tool";
 }) => Promise<QuotaQueueRpcResult>;
@@ -129,7 +144,19 @@ let activeController: {
   inspectAgent: (agentId: string) => Record<string, unknown> | null;
   checkNow: (agentId: string) => Promise<QuotaQueueGateDecision | null>;
   release: (agentId: string) => Promise<void>;
+  reconcileFromServer: (res: QuotaQueueRpcResult & { action?: string; agentId?: string }) => void;
 } | null = null;
+
+export function reconcileQuotaQueueFromServer(
+  res: (QuotaQueueRpcResult & { action?: string; agentId?: string }) | null | undefined,
+): void {
+  if (!res) return;
+  try {
+    activeController?.reconcileFromServer(res);
+  } catch {
+    // Ignore reconcile failure when guard is inactive
+  }
+}
 
 function getSafeStorage(storageOverride?: Storage | null): Storage | null {
   if (storageOverride) return storageOverride;
@@ -302,6 +329,32 @@ function extractRouteAgentId(win: Window): string | null {
   }
 }
 
+function extractRouteWorkspaceId(win: Window): string | null {
+  try {
+    const href = `${win.location?.pathname ?? ""} ${win.location?.hash ?? ""}`;
+    const m = /\/workspace\/(?:[^:/?#\s]+:)?(wks_[a-zA-Z0-9_-]+)/.exec(href);
+    return m?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function extractDomSelectedAgentId(doc: Document | null | undefined): string | null {
+  try {
+    if (!doc?.querySelector) return null;
+    const activeTab =
+      doc.querySelector('[data-testid^="workspace-tab-agent_"][aria-selected="true"]') ??
+      doc.querySelector('[data-testid^="workspace-tab-agent_"][data-active="true"]');
+    const tid = activeTab?.getAttribute?.("data-testid") ?? "";
+    if (tid.startsWith("workspace-tab-agent_")) {
+      return tid.slice("workspace-tab-agent_".length) || null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function formatRemainingWait(resumeAtMs: number | null, nowMs: number, isZh: boolean): string {
   if (!resumeAtMs || resumeAtMs <= nowMs) return "";
   const secs = Math.max(1, Math.ceil((resumeAtMs - nowMs) / 1000));
@@ -369,8 +422,8 @@ function renderHoldBanner(options: {
       "border-radius:8px",
       "font-size:12px",
       "line-height:16px",
-      "background:var(--paseo-finder-surface1, #fafafa)",
-      "border:1px solid var(--paseo-finder-border, #e4e4e7)",
+      "background:var(--paseo-finder-surface-1, #fafafa)",
+      "border:1px solid var(--paseo-finder-border-accent, #e4e4e7)",
       "color:var(--paseo-finder-fg-muted, #71717a)",
     ].join(";");
   }
@@ -379,10 +432,19 @@ function renderHoldBanner(options: {
     anchorRoot.parentElement.insertBefore(banner, anchorRoot);
   }
 
-  const etaTxt = formatRemainingWait(hold.resumeAtMs, Date.now(), isZh);
-  const statusText = isZh
-    ? `等待配额刷新并完成当前回合后再逐条发送 · ${queuedCount} 条排队${etaTxt ? ` · ${etaTxt}` : ""}`
-    : `Waiting for quota refresh & current turn before draining one by one · ${queuedCount} queued${etaTxt ? ` · ${etaTxt}` : ""}`;
+  const quotaAlreadyHealthy =
+    hold.quotaRefreshed === true ||
+    hold.reasonCode === "agent_running" ||
+    hold.reasonCode === "previous_turn_incomplete" ||
+    hold.reasonCode === "drain_cooldown";
+  const etaTxt = quotaAlreadyHealthy ? "" : formatRemainingWait(hold.resumeAtMs, Date.now(), isZh);
+  const statusText = quotaAlreadyHealthy
+    ? isZh
+      ? `配额正常 · 当前回合运行中，完成后逐条发送 · ${queuedCount} 条排队`
+      : `Quota healthy · waiting for current turn before draining 1 by 1 · ${queuedCount} queued`
+    : isZh
+      ? `等待配额刷新并完成当前回合后再逐条发送 · ${queuedCount} 条排队${etaTxt ? ` · ${etaTxt}` : ""}`
+      : `Waiting for quota refresh & current turn before draining one by one · ${queuedCount} queued${etaTxt ? ` · ${etaTxt}` : ""}`;
 
   let textSpan = banner.querySelector<HTMLSpanElement>('[data-role="status"]');
   let checkBtn = banner.querySelector<HTMLButtonElement>('[data-role="check"]');
@@ -400,9 +462,10 @@ function renderHoldBanner(options: {
       "padding:2px 8px",
       "border-radius:6px",
       "font-size:11px",
+      "font-weight:500",
       "cursor:pointer",
-      "background:var(--paseo-finder-surface2, #f4f4f5)",
-      "border:1px solid var(--paseo-finder-border, #e4e4e7)",
+      "background:var(--paseo-finder-surface-2, #f4f4f5)",
+      "border:1px solid var(--paseo-finder-border-accent, #e4e4e7)",
       "color:var(--paseo-finder-fg, #1a1a1e)",
     ].join(";");
 
@@ -425,6 +488,8 @@ export function installQuotaQueueGuard(options: {
   rpcCall?: QuotaQueueRpcCaller;
   getLocale?: () => string;
   nowFn?: () => number;
+  retryDelaysMs?: number[];
+  heartbeatMs?: number;
 }): () => void {
   const win = options.win ?? (typeof window !== "undefined" ? window : null);
   if (!win) return () => {};
@@ -440,7 +505,10 @@ export function installQuotaQueueGuard(options: {
   let boundStore: QuotaSessionStoreLike | null = null;
   let unsubscribeStore: (() => void) | null = null;
   let bindPollTimer: ReturnType<typeof setInterval> | null = null;
-  let restoredInitial = false;
+  let fetchedPersistedEntries = false;
+  let pendingRestoreEntries: NonNullable<QuotaQueueRpcResult["entries"]> = [];
+  const restoredAgentIds = new Set<string>();
+  const serialPendingAgents = new Set<string>();
 
   const heldStateByAgent = new Map<string, AgentHoldState>();
   const lastDispatchedAtByAgent = new Map<string, number>();
@@ -448,6 +516,13 @@ export function installQuotaQueueGuard(options: {
   const prevQueueSigByAgent = new Map<string, string>();
   const pollTimerByAgent = new Map<string, ReturnType<typeof setTimeout>>();
   const checkInFlightByAgent = new Map<string, Promise<QuotaQueueGateDecision | null>>();
+  const syncChainByAgent = new Map<string, Promise<void>>();
+  const dispatchInFlight = new Set<string>();
+  const dispatchFailuresByAgent = new Map<string, number>();
+  const retryTimerByAgent = new Map<string, ReturnType<typeof setTimeout>>();
+  const pendingDispatchedIdsByAgent = new Map<string, string[]>();
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let firstSweepTimer: ReturnType<typeof setTimeout> | null = null;
 
   const getRuntimeProto = (): HostRuntimeStoreLike | null => {
     const mod = findHostRuntimeModule(win as unknown as MetroWindow);
@@ -471,62 +546,283 @@ export function installQuotaQueueGuard(options: {
     }
   };
 
-  const syncAgentToServer = async (
+  const syncAgentToServer = (
     serverId: string,
     agentId: string,
     hold: AgentHoldState | null,
     queued: QuotaQueueItem[],
-  ) => {
-    if (!options.rpcCall || disposed) return;
+  ): Promise<void> => {
+    if (!options.rpcCall || disposed) return Promise.resolve();
     const state = boundStore?.getState();
     const slice = state?.sessions?.[serverId];
     const agent = slice?.agents?.get(agentId) ?? slice?.agentDetails?.get(agentId);
     const meta = resolveAgentModelAndProvider(agent);
-    try {
-      await options.rpcCall({
-        action: "sync",
-        agentId,
-        serverId,
-        provider: meta.provider,
-        model: meta.model,
-        title: meta.title,
-        held: Boolean(hold?.held),
-        reasonCode: hold?.reasonCode ?? "",
-        holdReason: hold?.reason ?? "",
-        lastErrorText: hold?.lastErrorText ?? null,
-        resumeAtMs: hold?.resumeAtMs ?? null,
-        queuedMessages: queued,
-        source: "runtime-guard",
+    const prev = syncChainByAgent.get(agentId) ?? Promise.resolve();
+    const next = prev
+      .catch(() => {})
+      .then(async () => {
+        if (!options.rpcCall || disposed) return;
+        const dispatchedMessageIds = pendingDispatchedIdsByAgent.get(agentId) ?? [];
+        pendingDispatchedIdsByAgent.delete(agentId);
+        try {
+          const res = await options.rpcCall({
+            action: "sync",
+            agentId,
+            serverId,
+            provider: meta.provider,
+            model: meta.model,
+            title: meta.title,
+            held: Boolean(hold?.held),
+            reasonCode: hold?.reasonCode ?? "",
+            holdReason: hold?.reason ?? "",
+            lastErrorText: hold?.lastErrorText ?? null,
+            resumeAtMs: hold?.resumeAtMs ?? null,
+            queuedMessages: queued,
+            ...(dispatchedMessageIds.length > 0 ? { dispatchedMessageIds } : {}),
+            source: "runtime-guard",
+          });
+          dropAlreadySent(serverId, agentId, res?.drainedMessageIds ?? []);
+        } catch {
+          // Non-fatal sync failure; re-offer the ids on the next sync.
+          if (dispatchedMessageIds.length > 0) {
+            const again = pendingDispatchedIdsByAgent.get(agentId) ?? [];
+            pendingDispatchedIdsByAgent.set(agentId, [...dispatchedMessageIds, ...again]);
+          }
+        }
       });
-    } catch {
-      // Non-fatal sync failure
+    syncChainByAgent.set(agentId, next);
+    return next;
+  };
+
+  const currentQueue = (serverId: string, agentId: string): QuotaQueueItem[] =>
+    boundStore?.getState()?.sessions?.[serverId]?.queuedMessages?.get(agentId) ?? [];
+
+  // The server ledger knows ids another drainer already sent (e.g. headless recovery while this
+  // window's heartbeat looked stale). Remove them so they are never sent a second time.
+  const dropAlreadySent = (serverId: string, agentId: string, ids: readonly string[]) => {
+    if (disposed || ids.length === 0) return;
+    const setQueued = boundStore?.getState()?.setQueuedMessages;
+    const sent = new Set(ids);
+    const before = currentQueue(serverId, agentId);
+    const dropped = before.filter((m) => sent.has(m.id));
+    if (dropped.length === 0 || typeof setQueued !== "function") return;
+    setQueued(serverId, (prev) => {
+      const next = new Map(prev);
+      const kept = (prev.get(agentId) ?? []).filter((m) => !sent.has(m.id));
+      if (kept.length === 0) next.delete(agentId);
+      else next.set(agentId, kept);
+      return next;
+    });
+    recordLocalReceipt(
+      {
+        at: new Date(nowFn()).toISOString(),
+        agentId,
+        action: "deduped",
+        queuedCount: before.length - dropped.length,
+        reasonCode: "already_sent",
+        detail: `Dropped ${dropped.length} queued message(s) already sent by another drainer (${dropped[0]?.text?.slice(0, 60) ?? ""})`,
+      },
+      storage,
+      win,
+    );
+  };
+
+  const clearRetryTimer = (agentId: string) => {
+    const t = retryTimerByAgent.get(agentId);
+    if (t !== undefined) {
+      clearTimeout(t);
+      retryTimerByAgent.delete(agentId);
+    }
+  };
+
+  const scheduleDispatchRetry = (serverId: string, agentId: string, attempt: number, errorText: string) => {
+    clearRetryTimer(agentId);
+    if (attempt >= MAX_DISPATCH_FAILURES) {
+      const queuedCount = currentQueue(serverId, agentId).length;
+      heldStateByAgent.set(agentId, {
+        serverId,
+        agentId,
+        held: true,
+        reasonCode: "dispatch_failed",
+        reason: `Queued message failed to send ${attempt} times: ${errorText}`,
+        resumeAtMs: null,
+        lastErrorText: errorText,
+        checkedAtMs: null,
+        quotaRefreshed: null,
+        previousTurnCompleted: true,
+        readyToDrain: false,
+        queuedCount,
+      });
+      updateBanner();
+      return;
+    }
+    const delays = options.retryDelaysMs?.length ? options.retryDelaysMs : DEFAULT_DISPATCH_RETRY_DELAYS_MS;
+    const delayMs = delays[Math.min(attempt - 1, delays.length - 1)];
+    retryTimerByAgent.set(
+      agentId,
+      setTimeout(() => {
+        retryTimerByAgent.delete(agentId);
+        if (!disposed) void checkAndMaybeDrain(agentId, false, serverId);
+      }, delayMs),
+    );
+  };
+
+  // Paseo 0.16.1's native drain does NOT return its send promise. It marks `${serverId}:${agentId}`
+  // in `queuedAgentDrainInFlight`, clears it in `finally`, and on failure puts the head back at the
+  // queue front. So the outcome is read from that state: in-flight cleared + head back = failed.
+  // (A returned promise, should upstream add one, is honoured first.)
+  // Persist the queue only once the outcome is known, so the server never stores a mid-send snapshot.
+  const handleDispatchOutcome = (
+    serverId: string,
+    agentId: string,
+    headId: string | undefined,
+    out: unknown,
+    runtime: HostRuntimeStoreLike | null,
+  ) => {
+    const settle = (status: string, errorText: string) => {
+      dispatchInFlight.delete(agentId);
+      if (disposed) return;
+      if (status === "failed") {
+        const attempt = (dispatchFailuresByAgent.get(agentId) ?? 0) + 1;
+        dispatchFailuresByAgent.set(agentId, attempt);
+        lastDispatchedAtByAgent.delete(agentId);
+        recordLocalReceipt(
+          {
+            at: new Date(nowFn()).toISOString(),
+            agentId,
+            action: "dispatch_failed",
+            queuedCount: currentQueue(serverId, agentId).length,
+            reasonCode: "send_failed",
+            detail: `Send failed (attempt ${attempt}): ${errorText.slice(0, 160)}`,
+          },
+          storage,
+          win,
+        );
+        scheduleDispatchRetry(serverId, agentId, attempt, errorText);
+      } else if (status === "submitted") {
+        dispatchFailuresByAgent.delete(agentId);
+        clearRetryTimer(agentId);
+        if (headId) {
+          pendingDispatchedIdsByAgent.set(agentId, [...(pendingDispatchedIdsByAgent.get(agentId) ?? []), headId]);
+        }
+      }
+      void syncAgentToServer(serverId, agentId, heldStateByAgent.get(agentId) ?? null, currentQueue(serverId, agentId));
+      updateBanner();
+    };
+    if (out && typeof (out as PromiseLike<unknown>).then === "function") {
+      dispatchInFlight.add(agentId);
+      (out as PromiseLike<unknown>).then(
+        (r) => {
+          const res = (r ?? {}) as { status?: unknown; errorMessage?: unknown };
+          settle(String(res.status ?? "submitted"), String(res.errorMessage ?? "unknown error"));
+        },
+        (err: unknown) => settle("failed", err instanceof Error ? err.message : String(err)),
+      );
+      return;
+    }
+    const inFlight = runtime?.queuedAgentDrainInFlight;
+    const key = `${serverId}:${agentId}`;
+    if (inFlight instanceof Set && inFlight.has(key)) {
+      dispatchInFlight.add(agentId);
+      const startedAt = Date.now();
+      const poll = () => {
+        if (disposed) {
+          dispatchInFlight.delete(agentId);
+          return;
+        }
+        if (inFlight.has(key) && Date.now() - startedAt < DISPATCH_OUTCOME_TIMEOUT_MS) {
+          setTimeout(poll, DISPATCH_OUTCOME_POLL_MS);
+          return;
+        }
+        const restored = Boolean(headId) && currentQueue(serverId, agentId)[0]?.id === headId;
+        if (inFlight.has(key)) settle("unknown", "");
+        else if (restored) settle("failed", "Paseo could not send the queued message (see daemon.log)");
+        else settle("submitted", "");
+      };
+      setTimeout(poll, DISPATCH_OUTCOME_POLL_MS);
+      return;
+    }
+    // Native declined (nothing in flight) or a legacy drain: just persist what is left shortly after.
+    setTimeout(() => settle("unknown", ""), 150);
+  };
+
+  const isStalledQueue = (serverId: string, agentId: string): boolean => {
+    const slice = boundStore?.getState()?.sessions?.[serverId];
+    const agent = slice?.agents?.get(agentId) ?? slice?.agentDetails?.get(agentId);
+    if (!agent) return false;
+    if (isAgentRunningSnapshot(agent) || slice?.initializingAgents?.get(agentId)) return false;
+    if (hasAgentPendingPermission(slice, agentId)) return false;
+    if (heldStateByAgent.get(agentId)?.held) return false;
+    if (
+      dispatchInFlight.has(agentId) ||
+      retryTimerByAgent.has(agentId) ||
+      pollTimerByAgent.has(agentId) ||
+      checkInFlightByAgent.has(agentId)
+    ) {
+      return false;
+    }
+    const last = lastDispatchedAtByAgent.get(agentId);
+    return !(typeof last === "number" && nowFn() - last < STALL_GRACE_MS);
+  };
+
+  const heartbeatTick = () => {
+    if (disposed || !boundStore) return;
+    const prefs = readQuotaQueuePrefs(storage);
+    if (!prefs.enabled) return;
+    const sessions = boundStore.getState()?.sessions ?? {};
+    for (const [serverId, slice] of Object.entries(sessions)) {
+      for (const [agentId, items] of slice?.queuedMessages?.entries() ?? []) {
+        if (!items || items.length === 0) continue;
+        void syncAgentToServer(serverId, agentId, heldStateByAgent.get(agentId) ?? null, items);
+        if (prefs.autoDrain && isStalledQueue(serverId, agentId)) {
+          void checkAndMaybeDrain(agentId, false, serverId);
+        }
+      }
     }
   };
 
   const updateBanner = () => {
     if (disposed || !win.document) return;
     const isZh = getLocale().toLowerCase().startsWith("zh");
-    const routeAgentId = extractRouteAgentId(win);
+    const routeAgentId = extractRouteAgentId(win) ?? extractDomSelectedAgentId(win.document);
+    const routeWorkspaceId = extractRouteWorkspaceId(win);
+    const sessions = boundStore?.getState()?.sessions ?? {};
     let activeHold: AgentHoldState | null = null;
     let activeQueued = 0;
 
-    if (routeAgentId && heldStateByAgent.has(routeAgentId)) {
-      const h = heldStateByAgent.get(routeAgentId)!;
-      const qLen = boundStore?.getState()?.sessions?.[h.serverId]?.queuedMessages?.get(routeAgentId)?.length ?? 0;
-      if (h.held && qLen > 0) {
-        activeHold = h;
-        activeQueued = qLen;
+    if (routeAgentId) {
+      const h = heldStateByAgent.get(routeAgentId);
+      if (h && h.held) {
+        const qLen = sessions[h.serverId]?.queuedMessages?.get(routeAgentId)?.length ?? 0;
+        if (qLen > 0) {
+          activeHold = h;
+          activeQueued = qLen;
+        }
+      }
+    } else if (routeWorkspaceId) {
+      for (const h of heldStateByAgent.values()) {
+        if (!h.held) continue;
+        const slice = sessions[h.serverId];
+        const ag = slice?.agents?.get(h.agentId) ?? slice?.agentDetails?.get(h.agentId);
+        if (String(ag?.workspaceId ?? "") !== routeWorkspaceId) continue;
+        const qLen = slice?.queuedMessages?.get(h.agentId)?.length ?? 0;
+        if (qLen > 0) {
+          activeHold = h;
+          activeQueued = qLen;
+          break;
+        }
       }
     } else {
-      // Fallback: if single held agent matches current DOM
-      for (const h of heldStateByAgent.values()) {
-        const qLen = boundStore?.getState()?.sessions?.[h.serverId]?.queuedMessages?.get(h.agentId)?.length ?? 0;
-        if (h.held && qLen > 0) {
-          if (!routeAgentId) {
+      const pathStr = String(win.location?.pathname ?? "");
+      if (!pathStr.includes("/settings") && !pathStr.includes("/schedules")) {
+        // Fallback only when no workspace/agent route is present (e.g. root single-agent test)
+        for (const h of heldStateByAgent.values()) {
+          const qLen = sessions[h.serverId]?.queuedMessages?.get(h.agentId)?.length ?? 0;
+          if (h.held && qLen > 0) {
             activeHold = h;
             activeQueued = qLen;
+            break;
           }
-          break;
         }
       }
     }
@@ -583,17 +879,31 @@ export function installQuotaQueueGuard(options: {
     return { prefs, slice, agent, queued, turnSignal, decision };
   };
 
-  const scheduleHoldCheck = (serverId: string, agentId: string, resumeAtMs: number | null) => {
+  const scheduleHoldCheck = (
+    serverId: string,
+    agentId: string,
+    resumeAtMs: number | null,
+    reasonCode?: string,
+  ) => {
     if (disposed || pollTimerByAgent.has(agentId)) return;
     const prefs = readQuotaQueuePrefs(storage);
     if (!prefs.enabled || !prefs.autoDrain) return;
 
     const nowMs = nowFn();
-    let delayMs = 20_000;
+    let delayMs =
+      reasonCode === "drain_cooldown"
+        ? 1_500
+        : reasonCode === "agent_running"
+          ? 60_000
+          : 20_000;
     if (resumeAtMs && resumeAtMs > nowMs) {
       const remaining = resumeAtMs - nowMs;
       // Check slightly more often if near expiry, otherwise every 45s so early pool/credit recovery is caught promptly
-      delayMs = remaining <= 60_000 ? Math.max(5_000, remaining + 1_000) : 45_000;
+      if (reasonCode === "drain_cooldown") {
+        delayMs = Math.max(300, remaining + 100);
+      } else {
+        delayMs = remaining <= 60_000 ? Math.max(5_000, remaining + 1_000) : 45_000;
+      }
     }
 
     const timer = setTimeout(() => {
@@ -613,7 +923,8 @@ export function installQuotaQueueGuard(options: {
     const orig = patchInfo?.origDrain;
     if (!runtime || typeof orig !== "function") return false;
     lastDispatchedAtByAgent.set(agentId, nowFn());
-    orig.call(runtime, serverId, agentId);
+    const headId = currentQueue(serverId, agentId)[0]?.id;
+    handleDispatchOutcome(serverId, agentId, headId, orig.call(runtime, serverId, agentId), runtime);
     return true;
   };
 
@@ -626,6 +937,7 @@ export function installQuotaQueueGuard(options: {
     const existingFlight = checkInFlightByAgent.get(agentId);
     if (existingFlight) return existingFlight;
 
+    if (bypassDebounce) dispatchFailuresByAgent.delete(agentId);
     const run = (async (): Promise<QuotaQueueGateDecision | null> => {
       const serverId =
         explicitServerId ??
@@ -633,7 +945,7 @@ export function installQuotaQueueGuard(options: {
         findServerIdForAgent(agentId);
       if (!serverId) return null;
 
-      const { prefs, queued, turnSignal } = evaluateLocalSnapshot(serverId, agentId);
+      const { prefs, slice, agent, queued, turnSignal } = evaluateLocalSnapshot(serverId, agentId);
       if (queued.length === 0) {
         heldStateByAgent.delete(agentId);
         clearAgentPollTimer(agentId);
@@ -648,7 +960,13 @@ export function installQuotaQueueGuard(options: {
         return { allow: true, reasonCode: "disabled", reason: "Disabled", resumeAtMs: null };
       }
 
-      if (options.rpcCall) {
+      const locallyRunningOrInit =
+        isAgentRunningSnapshot(agent) || Boolean(slice?.initializingAgents?.get(agentId));
+
+      // Smart Skip: While the agent is visibly running/initializing in useSessionStore, do not
+      // spawn `antigravity-ops paseo-recovery` subprocesses on the plugin worker every 20s;
+      // `onStoreUpdate` triggers `checkAndMaybeDrain` immediately once the turn settles.
+      if (options.rpcCall && (bypassDebounce || !locallyRunningOrInit)) {
         try {
           const rpcRes = await options.rpcCall({
             action: "check",
@@ -659,14 +977,25 @@ export function installQuotaQueueGuard(options: {
           });
           const resumeAtMs = rpcRes.resumeAtIso ? Date.parse(rpcRes.resumeAtIso) : null;
           const prev = heldStateByAgent.get(agentId);
+          const nextReasonCode = rpcRes.readyToDrain
+            ? "ok"
+            : rpcRes.quotaRefreshed === true
+              ? "agent_running"
+              : "quota_wait";
           heldStateByAgent.set(agentId, {
             serverId,
             agentId,
             held: !rpcRes.readyToDrain,
-            reasonCode: rpcRes.readyToDrain ? "ok" : "quota_wait",
+            reasonCode: nextReasonCode,
             reason: rpcRes.holdReason || prev?.reason || "Waiting for quota refresh",
-            resumeAtMs: Number.isFinite(resumeAtMs) ? resumeAtMs : (prev?.resumeAtMs ?? null),
-            lastErrorText: prev?.lastErrorText ?? turnSignal.errorText,
+            resumeAtMs:
+              rpcRes.quotaRefreshed === true
+                ? null
+                : (Number.isFinite(resumeAtMs) ? resumeAtMs : (prev?.resumeAtMs ?? null)),
+            lastErrorText:
+              rpcRes.quotaRefreshed === true
+                ? null
+                : (prev?.lastErrorText ?? turnSignal.errorText),
             checkedAtMs: nowFn(),
             quotaRefreshed: rpcRes.quotaRefreshed,
             previousTurnCompleted: rpcRes.previousTurnCompleted,
@@ -684,8 +1013,11 @@ export function installQuotaQueueGuard(options: {
         clearAgentPollTimer(agentId);
         updateBanner();
         if (post.prefs.autoDrain) {
+          const hadMoreThanOne = post.queued.length > 1;
           const sent = callOriginalDrain(serverId, agentId);
           if (sent) {
+            if (hadMoreThanOne) serialPendingAgents.add(agentId);
+            else serialPendingAgents.delete(agentId);
             recordLocalReceipt(
               {
                 at: new Date(nowFn()).toISOString(),
@@ -698,9 +1030,6 @@ export function installQuotaQueueGuard(options: {
               storage,
               win,
             );
-            const afterSlice = boundStore?.getState()?.sessions?.[serverId];
-            const afterQueued = afterSlice?.queuedMessages?.get(agentId) ?? [];
-            void syncAgentToServer(serverId, agentId, null, afterQueued);
           }
         }
       } else {
@@ -721,7 +1050,7 @@ export function installQuotaQueueGuard(options: {
         };
         heldStateByAgent.set(agentId, hold);
         updateBanner();
-        scheduleHoldCheck(serverId, agentId, hold.resumeAtMs);
+        scheduleHoldCheck(serverId, agentId, hold.resumeAtMs, hold.reasonCode);
       }
 
       return post.decision;
@@ -802,7 +1131,7 @@ export function installQuotaQueueGuard(options: {
         );
         void syncAgentToServer(serverId, agentId, hold, queued);
         updateBanner();
-        scheduleHoldCheck(serverId, agentId, hold.resumeAtMs);
+        scheduleHoldCheck(serverId, agentId, hold.resumeAtMs, hold.reasonCode);
         return;
       }
 
@@ -822,8 +1151,11 @@ export function installQuotaQueueGuard(options: {
       }
 
       // Allowed: drain strictly 1 item (`o[0]`) and record dispatch timestamp for serial pacing
+      if (queued.length > 1) serialPendingAgents.add(agentId);
+      else serialPendingAgents.delete(agentId);
       lastDispatchedAtByAgent.set(agentId, nowFn());
       const out = origDrain.call(this, serverId, agentId);
+      handleDispatchOutcome(serverId, agentId, queued[0]?.id, out, this);
       recordLocalReceipt(
         {
           at: new Date(nowFn()).toISOString(),
@@ -836,12 +1168,6 @@ export function installQuotaQueueGuard(options: {
         storage,
         win,
       );
-      setTimeout(() => {
-        if (disposed) return;
-        const afterQueued = boundStore?.getState()?.sessions?.[serverId]?.queuedMessages?.get(agentId) ?? [];
-        void syncAgentToServer(serverId, agentId, null, afterQueued);
-        updateBanner();
-      }, 150);
       return out;
     };
 
@@ -853,73 +1179,197 @@ export function installQuotaQueueGuard(options: {
     return true;
   };
 
+  const applyPendingRestores = () => {
+    if (disposed || !boundStore || pendingRestoreEntries.length === 0) return;
+    const state = boundStore.getState();
+    const sessions = state.sessions ?? {};
+    const setQueued = state.setQueuedMessages;
+    const stillPending: NonNullable<QuotaQueueRpcResult["entries"]> = [];
+    let restoredAny = false;
+
+    for (const entry of pendingRestoreEntries) {
+      if (restoredAgentIds.has(entry.agentId)) continue;
+      if (!entry.queuedMessages || entry.queuedMessages.length === 0) continue;
+
+      const byExplicitServer =
+        sessions[entry.serverId]?.agents?.has(entry.agentId) ? entry.serverId : undefined;
+      const byAgentScan = Object.keys(sessions).find((sid) =>
+        sessions[sid]?.agents?.has(entry.agentId),
+      );
+      const targetServerId = byExplicitServer ?? byAgentScan;
+      if (!targetServerId) {
+        stillPending.push(entry);
+        continue;
+      }
+
+      restoredAgentIds.add(entry.agentId);
+      restoredAny = true;
+      const existingQueue = sessions[targetServerId]?.queuedMessages?.get(entry.agentId) ?? [];
+      if (existingQueue.length === 0 && typeof setQueued === "function") {
+        setQueued(targetServerId, (prev) => {
+          const next = new Map(prev);
+          next.set(entry.agentId, entry.queuedMessages);
+          return next;
+        });
+        recordLocalReceipt(
+          {
+            at: new Date(nowFn()).toISOString(),
+            agentId: entry.agentId,
+            action: "restored",
+            queuedCount: entry.queuedMessages.length,
+            reasonCode: entry.reasonCode || "restored",
+            detail: `Restored ${entry.queuedMessages.length} held queued message(s) after reload`,
+          },
+          storage,
+          win,
+        );
+      }
+
+      if (entry.held) {
+        const entryQuotaRefreshed =
+          entry.quotaRefreshed === true ||
+          entry.reasonCode === "agent_running" ||
+          entry.reasonCode === "previous_turn_incomplete";
+        const resumeMs =
+          entryQuotaRefreshed || !entry.resumeAtIso ? null : Date.parse(entry.resumeAtIso);
+        heldStateByAgent.set(entry.agentId, {
+          serverId: targetServerId,
+          agentId: entry.agentId,
+          held: true,
+          reasonCode: entry.reasonCode || (entryQuotaRefreshed ? "agent_running" : "quota_error_hold"),
+          reason: entry.holdReason || "Waiting for quota refresh",
+          resumeAtMs: resumeMs !== null && Number.isFinite(resumeMs) ? resumeMs : null,
+          lastErrorText: entryQuotaRefreshed ? null : (entry.lastErrorText ?? null),
+          checkedAtMs: null,
+          quotaRefreshed: entryQuotaRefreshed,
+          previousTurnCompleted: Boolean(entry.previousTurnCompleted),
+          readyToDrain: false,
+          queuedCount: Math.max(existingQueue.length, entry.queuedMessages.length),
+        });
+        scheduleHoldCheck(
+          targetServerId,
+          entry.agentId,
+          resumeMs !== null && Number.isFinite(resumeMs) ? resumeMs : null,
+          entry.reasonCode || (entryQuotaRefreshed ? "agent_running" : "quota_error_hold"),
+        );
+      } else if (entry.queuedMessages.length > 0) {
+        serialPendingAgents.add(entry.agentId);
+      }
+    }
+
+    pendingRestoreEntries = stillPending;
+    if (restoredAny) {
+      updateBanner();
+    }
+  };
+
   const restorePersistedQueuesIfEmpty = async () => {
-    if (restoredInitial || !options.rpcCall || !boundStore || disposed) return;
-    restoredInitial = true;
+    if (fetchedPersistedEntries || !options.rpcCall || !boundStore || disposed) return;
+    fetchedPersistedEntries = true;
     try {
       const status = await options.rpcCall({ action: "status", source: "runtime-guard" });
       const entries = status.entries ?? [];
       if (entries.length === 0) return;
+      pendingRestoreEntries = entries;
+      applyPendingRestores();
+    } catch {
+      fetchedPersistedEntries = false;
+    }
+  };
 
-      const state = boundStore.getState();
-      const sessions = state.sessions ?? {};
-      const setQueued = state.setQueuedMessages;
-      for (const entry of entries) {
-        if (!entry.queuedMessages || entry.queuedMessages.length === 0) continue;
-        const targetServerId = sessions[entry.serverId]
+  const reconcileFromServer = (
+    res: QuotaQueueRpcResult & { action?: string; agentId?: string },
+  ) => {
+    if (disposed || !boundStore) return;
+    const state = boundStore.getState();
+    const sessions = state.sessions ?? {};
+    const setQueued = state.setQueuedMessages;
+    const entriesByAgent = new Map((res.entries ?? []).map((e) => [e.agentId, e]));
+
+    if (res.action === "reset") {
+      for (const aid of heldStateByAgent.keys()) clearAgentPollTimer(aid);
+      heldStateByAgent.clear();
+      serialPendingAgents.clear();
+      pendingRestoreEntries = [];
+      updateBanner();
+      return;
+    }
+
+    const targetAgents = new Set<string>([
+      ...heldStateByAgent.keys(),
+      ...entriesByAgent.keys(),
+      ...(res.agentId ? [res.agentId] : []),
+    ]);
+    for (const aid of targetAgents) {
+      const entry = entriesByAgent.get(aid);
+      const serverId =
+        entry?.serverId && sessions[entry.serverId]
           ? entry.serverId
-          : Object.keys(sessions).find((sid) => sessions[sid]?.agents?.has(entry.agentId));
-        if (!targetServerId) continue;
+          : (heldStateByAgent.get(aid)?.serverId ?? findServerIdForAgent(aid));
+      if (!serverId) continue;
 
-        const existingQueue = sessions[targetServerId]?.queuedMessages?.get(entry.agentId) ?? [];
-        if (existingQueue.length === 0 && typeof setQueued === "function") {
-          setQueued(targetServerId, (prev) => {
+      if (!entry) {
+        heldStateByAgent.delete(aid);
+        serialPendingAgents.delete(aid);
+        clearAgentPollTimer(aid);
+        if (typeof setQueued === "function") {
+          setQueued(serverId, (prev) => {
+            if (!prev.has(aid)) return prev;
             const next = new Map(prev);
-            next.set(entry.agentId, entry.queuedMessages);
+            next.delete(aid);
             return next;
           });
-          recordLocalReceipt(
-            {
-              at: new Date(nowFn()).toISOString(),
-              agentId: entry.agentId,
-              action: "restored",
-              queuedCount: entry.queuedMessages.length,
-              reasonCode: entry.reasonCode || "restored",
-              detail: `Restored ${entry.queuedMessages.length} held queued message(s) after reload`,
-            },
-            storage,
-            win,
-          );
         }
-
-        if (entry.held) {
-          const resumeMs = entry.resumeAtIso ? Date.parse(entry.resumeAtIso) : null;
-          heldStateByAgent.set(entry.agentId, {
-            serverId: targetServerId,
-            agentId: entry.agentId,
-            held: true,
-            reasonCode: entry.reasonCode || "quota_error_hold",
-            reason: entry.holdReason || "Waiting for quota refresh",
-            resumeAtMs: Number.isFinite(resumeMs) ? resumeMs : null,
-            lastErrorText: entry.lastErrorText ?? null,
-            checkedAtMs: null,
-            quotaRefreshed: false,
-            previousTurnCompleted: false,
-            readyToDrain: false,
-            queuedCount: Math.max(existingQueue.length, entry.queuedMessages.length),
-          });
-          scheduleHoldCheck(targetServerId, entry.agentId, Number.isFinite(resumeMs) ? resumeMs : null);
-        }
+        continue;
       }
-      updateBanner();
-    } catch {
-      // Ignore startup restore error
+
+      if (typeof setQueued === "function") {
+        setQueued(serverId, (prev) => {
+          const next = new Map(prev);
+          if (entry.queuedMessages.length === 0) next.delete(aid);
+          else next.set(aid, entry.queuedMessages);
+          return next;
+        });
+      }
+
+      if (entry.held) {
+        const entryQuotaRefreshed =
+          res.quotaRefreshed === true ||
+          entry.quotaRefreshed === true ||
+          entry.reasonCode === "agent_running" ||
+          entry.reasonCode === "previous_turn_incomplete";
+        const resumeMs =
+          entryQuotaRefreshed || !entry.resumeAtIso ? null : Date.parse(entry.resumeAtIso);
+        heldStateByAgent.set(aid, {
+          serverId,
+          agentId: aid,
+          held: true,
+          reasonCode: entry.reasonCode || (entryQuotaRefreshed ? "agent_running" : "quota_error_hold"),
+          reason: entry.holdReason || "Waiting for quota refresh",
+          resumeAtMs: resumeMs !== null && Number.isFinite(resumeMs) ? resumeMs : null,
+          lastErrorText: entryQuotaRefreshed ? null : (entry.lastErrorText ?? null),
+          checkedAtMs: nowFn(),
+          quotaRefreshed: entryQuotaRefreshed,
+          previousTurnCompleted: Boolean(res.previousTurnCompleted),
+          readyToDrain: Boolean(res.readyToDrain),
+          queuedCount: entry.queuedMessages.length,
+        });
+      } else {
+        heldStateByAgent.delete(aid);
+        clearAgentPollTimer(aid);
+        if (entry.queuedMessages.length > 0) serialPendingAgents.add(aid);
+        else serialPendingAgents.delete(aid);
+      }
     }
+    updateBanner();
   };
 
   const onStoreUpdate = () => {
     if (disposed || !boundStore) return;
     installRuntimeDrainPatch();
+    if (pendingRestoreEntries.length > 0) {
+      applyPendingRestores();
+    }
     const sessions = boundStore.getState()?.sessions ?? {};
 
     for (const [serverId, slice] of Object.entries(sessions)) {
@@ -931,11 +1381,35 @@ export function installQuotaQueueGuard(options: {
           const sig = `${items.length}:${items.map((x) => x.id).join(",")}`;
           if (prevQueueSigByAgent.get(agentId) !== sig) {
             prevQueueSigByAgent.set(agentId, sig);
-            const hold = heldStateByAgent.get(agentId) ?? null;
-            if (items.length > 0 && (hold?.held || agentsMap?.get(agentId)?.status === "error")) {
-              void syncAgentToServer(serverId, agentId, hold, items);
+            let hold = heldStateByAgent.get(agentId) ?? null;
+            if (items.length > 0 && !hold?.held && agentsMap?.get(agentId)?.status === "error") {
+              const ev = evaluateLocalSnapshot(serverId, agentId);
+              if (!ev.decision.allow) {
+                hold = {
+                  serverId,
+                  agentId,
+                  held: true,
+                  reasonCode: ev.decision.reasonCode,
+                  reason: ev.decision.reason,
+                  resumeAtMs: ev.decision.resumeAtMs,
+                  lastErrorText: ev.turnSignal.errorText ?? null,
+                  checkedAtMs: null,
+                  quotaRefreshed: false,
+                  previousTurnCompleted:
+                    ev.decision.reasonCode !== "previous_turn_incomplete" &&
+                    !ev.turnSignal.previousTurnIncomplete,
+                  readyToDrain: false,
+                  queuedCount: items.length,
+                };
+                heldStateByAgent.set(agentId, hold);
+                scheduleHoldCheck(serverId, agentId, hold.resumeAtMs, hold.reasonCode);
+              }
+            }
+            if (items.length > 0 && !dispatchInFlight.has(agentId)) {
+              void syncAgentToServer(serverId, agentId, hold?.held ? hold : null, items);
             } else if (items.length === 0 && hold) {
               heldStateByAgent.delete(agentId);
+              serialPendingAgents.delete(agentId);
               clearAgentPollTimer(agentId);
               void syncAgentToServer(serverId, agentId, null, []);
             }
@@ -949,12 +1423,14 @@ export function installQuotaQueueGuard(options: {
           const wasRunning = prevRunningByAgent.get(agentId) ?? false;
           prevRunningByAgent.set(agentId, runningNow);
 
-          if (wasRunning && !runningNow && heldStateByAgent.has(agentId)) {
+          if (wasRunning && !runningNow && (heldStateByAgent.has(agentId) || serialPendingAgents.has(agentId))) {
             const qLen = queuedMap?.get(agentId)?.length ?? 0;
             if (qLen > 0) {
               setTimeout(() => {
                 if (!disposed) void checkAndMaybeDrain(agentId, false, serverId);
               }, 350);
+            } else {
+              serialPendingAgents.delete(agentId);
             }
           }
         }
@@ -979,6 +1455,15 @@ export function installQuotaQueueGuard(options: {
     }
     void restorePersistedQueuesIfEmpty();
     onStoreUpdate();
+    if (heartbeatTimer === null) {
+      const everyMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+      heartbeatTimer = setInterval(heartbeatTick, everyMs);
+      // First sweep soon after bind, so a queue stranded before a reload does not wait a full period.
+      firstSweepTimer = setTimeout(() => {
+        firstSweepTimer = null;
+        heartbeatTick();
+      }, Math.min(2_000, everyMs));
+    }
   };
 
   tryBind();
@@ -1029,6 +1514,12 @@ export function installQuotaQueueGuard(options: {
     }
     for (const t of pollTimerByAgent.values()) clearTimeout(t);
     pollTimerByAgent.clear();
+    for (const t of retryTimerByAgent.values()) clearTimeout(t);
+    retryTimerByAgent.clear();
+    if (heartbeatTimer !== null) clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+    if (firstSweepTimer !== null) clearTimeout(firstSweepTimer);
+    firstSweepTimer = null;
     win.removeEventListener("popstate", onRouteOrFocus);
     win.removeEventListener("hashchange", onRouteOrFocus);
     removeHoldBanner(win.document);
@@ -1065,6 +1556,7 @@ export function installQuotaQueueGuard(options: {
         callOriginalDrain(sid, agentId);
       }
     },
+    reconcileFromServer,
   };
 
   (win as unknown as Record<string, unknown>)[GLOBAL_BRIDGE_KEY] = {
@@ -1072,6 +1564,7 @@ export function installQuotaQueueGuard(options: {
     inspectAgent: activeController.inspectAgent,
     checkNow: activeController.checkNow,
     release: activeController.release,
+    reconcileFromServer,
     setPrefs: (partial: Partial<QuotaQueueGuardPrefs>) =>
       syncQuotaQueuePrefs(partial, storage, win),
   };
