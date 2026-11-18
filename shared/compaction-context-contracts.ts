@@ -63,8 +63,8 @@ export function resolveAntigravityModelContextMaxTokens(modelId?: string | null)
 
 /**
  * Returns the effective context ceiling at which `agy_cli` triggers automatic `CHECKPOINT`
- * compaction (`cascade_config.checkpoint_config.max_token_limit`), aligned with
- * `~/.gemini/antigravity-cli/context_limits.json` SSOT:
+ * compaction (`cascade_config.checkpoint_config.max_token_limit`), aligned with the
+ * runtime `context_limits.json` SSOT:
  *
  * - Built-in `agy_cli` Gemini models (`gemini-3.8-flash*`, `gemini-4-argon*`, `gemini-2.5*`)
  *   use `effectiveGeminiMaxTokens` (default `600,000`, monotonically auto-evolving with upstream).
