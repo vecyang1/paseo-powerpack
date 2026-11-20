@@ -163,6 +163,15 @@ export function SwarmWorkflowSettingsSection({
           <SettingsSwitch
             label={
               isZh
+                ? "在 Overview 标签页默认展开已完成任务卡片（手动折叠后保持折叠）"
+                : "Expand Overview completed tasks card by default (respects manual collapse)"
+            }
+            value={prefs.expandOverviewTasksByDefault}
+            onValueChange={(v) => updatePref("expandOverviewTasksByDefault", v)}
+          />
+          <SettingsSwitch
+            label={
+              isZh
                 ? "拦截聊天中 sidecar://swarm/swarm_board 链接直开 Swarm 面板"
                 : "Intercept sidecar://swarm/swarm_board chat links into Swarm panel"
             }

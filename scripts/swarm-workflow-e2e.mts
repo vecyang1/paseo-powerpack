@@ -446,6 +446,43 @@ async function main() {
         `title=${JSON.stringify(realSwarmTitle)}`,
       );
       await page.screenshot({ path: path.join(SHOTS, "10-real-workspace-swarm-tab.png") });
+
+      // Verify Overview 'N of M tasks done' card is expanded by default AND respects manual collapse
+      if (realFrame) {
+        const overviewTabBtn = realFrame.locator('[data-tab="overview"], button:has-text("Overview")').first();
+        if (await overviewTabBtn.isVisible().catch(() => false)) {
+          await overviewTabBtn.click();
+          await sleep(600);
+        }
+        const doneToggle = realFrame.locator('button.o2-progh[data-o2="doneOpen"]').first();
+        const toggleVisible = await doneToggle
+          .waitFor({ state: "visible", timeout: 8_000 })
+          .then(() => true)
+          .catch(() => false);
+        const expandedByDefault = toggleVisible
+          ? (await doneToggle.getAttribute("aria-expanded")) === "true" &&
+            (await realFrame.locator(".o2-prog .o2-progb").isVisible().catch(() => false))
+          : false;
+        await page.screenshot({ path: path.join(SHOTS, "11-overview-tasks-expanded-default.png") });
+        check(
+          "Overview 'N of M tasks done' card is expanded by default without clicking",
+          expandedByDefault,
+          `toggleVisible=${toggleVisible}`,
+        );
+
+        let staysCollapsedAfterClick = false;
+        if (toggleVisible && expandedByDefault) {
+          await doneToggle.click();
+          await sleep(500);
+          staysCollapsedAfterClick =
+            (await doneToggle.getAttribute("aria-expanded")) === "false";
+        }
+        check(
+          "Manually collapsing 'N of M tasks done' stays collapsed (no auto-reopen fight)",
+          staysCollapsedAfterClick,
+          `collapsed=${staysCollapsedAfterClick}`,
+        );
+      }
     }
 
     check("Zero uncaught page errors during E2E", pageErrors.length === 0, pageErrors.join("; "));

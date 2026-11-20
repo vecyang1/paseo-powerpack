@@ -25,6 +25,7 @@ export interface SwarmWorkflowPrefs {
   interceptSidecarLinks: boolean;
   enableLiveSwarmCard: boolean;
   autoOpenSwarmTabOnStart: boolean;
+  expandOverviewTasksByDefault: boolean;
 }
 
 export const DEFAULT_SWARM_WORKFLOW_PREFS: SwarmWorkflowPrefs = {
@@ -33,6 +34,7 @@ export const DEFAULT_SWARM_WORKFLOW_PREFS: SwarmWorkflowPrefs = {
   interceptSidecarLinks: true,
   enableLiveSwarmCard: true,
   autoOpenSwarmTabOnStart: true,
+  expandOverviewTasksByDefault: true,
 };
 
 export interface SwarmWorkflowReceipt {
@@ -103,6 +105,7 @@ export function readSwarmWorkflowPrefs(): SwarmWorkflowPrefs {
       interceptSidecarLinks: parsed.interceptSidecarLinks ?? true,
       enableLiveSwarmCard: parsed.enableLiveSwarmCard ?? true,
       autoOpenSwarmTabOnStart: parsed.autoOpenSwarmTabOnStart ?? true,
+      expandOverviewTasksByDefault: parsed.expandOverviewTasksByDefault ?? true,
     };
   } catch {
     return { ...DEFAULT_SWARM_WORKFLOW_PREFS };
@@ -363,6 +366,22 @@ export function mountSwarmBoardIframe(options: MountSwarmBoardIframeOptions): ()
 
   window.addEventListener("message", onWindowMessage);
 
+  const onPrefsChanged = () => {
+    if (disposed || !iframeEl?.contentWindow) return;
+    try {
+      iframeEl.contentWindow.postMessage(
+        {
+          type: "paseo-swarm-set-prefs",
+          payload: { expandDoneTasks: readSwarmWorkflowPrefs().expandOverviewTasksByDefault },
+        },
+        "*",
+      );
+    } catch {
+      // ignore
+    }
+  };
+  window.addEventListener(SWARM_WORKFLOW_STATE_EVENT, onPrefsChanged);
+
   const attach = (attempt = 0) => {
     if (disposed) return;
     const host = document.querySelector<HTMLElement>(`[data-testid="${hostTestId}"]`);
@@ -382,6 +401,10 @@ export function mountSwarmBoardIframe(options: MountSwarmBoardIframeOptions): ()
     if (conversationId) url.searchParams.set("conversationId", conversationId);
     if (initialSwarmTab) url.searchParams.set("tab", initialSwarmTab);
     url.searchParams.set("scheme", buildSwarmSidecarThemePayload(document, window).colorScheme);
+    url.searchParams.set(
+      "expandDoneTasks",
+      readSwarmWorkflowPrefs().expandOverviewTasksByDefault ? "1" : "0",
+    );
 
     let frame = host.querySelector<HTMLIFrameElement>("iframe[data-paseo-swarm-board-frame='true']");
     if (!frame) {
@@ -444,6 +467,7 @@ export function mountSwarmBoardIframe(options: MountSwarmBoardIframeOptions): ()
     disposed = true;
     if (retryTimer) clearTimeout(retryTimer);
     window.removeEventListener("message", onWindowMessage);
+    window.removeEventListener(SWARM_WORKFLOW_STATE_EVENT, onPrefsChanged);
     themeObserver?.disconnect();
     if (iframeEl) {
       try {

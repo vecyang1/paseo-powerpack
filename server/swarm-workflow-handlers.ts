@@ -263,6 +263,49 @@ function buildPaseoSwarmPreloadJs(): string {
   var params = new URLSearchParams(window.location.search);
   var currentConversationId = params.get("conversationId") || "";
   var currentToken = params.get("token") || "";
+  var expandDoneTasksDefault = params.get("expandDoneTasks") !== "0";
+  var userToggledDoneOpen = false;
+  var autoClickingDoneOpen = false;
+  var expandRetryTimer = null;
+
+  function maybeAutoExpandDoneTasks() {
+    if (!expandDoneTasksDefault || userToggledDoneOpen) return;
+    if (!document || typeof document.querySelector !== "function") return;
+    var btn = document.querySelector('button.o2-progh[data-o2="doneOpen"][aria-expanded="false"]');
+    if (!btn || typeof btn.click !== "function") return;
+    if (typeof btn.onclick !== "function") {
+      if (expandRetryTimer) clearTimeout(expandRetryTimer);
+      expandRetryTimer = setTimeout(function () {
+        expandRetryTimer = null;
+        maybeAutoExpandDoneTasks();
+      }, 30);
+      return;
+    }
+    autoClickingDoneOpen = true;
+    try {
+      btn.click();
+    } finally {
+      autoClickingDoneOpen = false;
+    }
+  }
+
+  document.addEventListener("click", function (ev) {
+    if (autoClickingDoneOpen) return;
+    var target = ev && ev.target;
+    if (!target || typeof target.closest !== "function") return;
+    if (target.closest('button.o2-progh[data-o2="doneOpen"]')) {
+      userToggledDoneOpen = true;
+    }
+  }, true);
+
+  function installOverviewAutoExpandObserver() {
+    maybeAutoExpandDoneTasks();
+    if (typeof MutationObserver === "undefined" || !document.documentElement) return;
+    var mo = new MutationObserver(function () {
+      maybeAutoExpandDoneTasks();
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+  }
 
   function applyThemeVars(vars, scheme) {
     if (!vars || typeof vars !== "object") return;
@@ -299,9 +342,13 @@ function buildPaseoSwarmPreloadJs(): string {
     document.body.style.minHeight = "100%";
   }
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", applyBodyBase);
+    document.addEventListener("DOMContentLoaded", function () {
+      applyBodyBase();
+      installOverviewAutoExpandObserver();
+    });
   } else {
     applyBodyBase();
+    installOverviewAutoExpandObserver();
   }
 
   window.addEventListener("message", function (event) {
@@ -309,7 +356,15 @@ function buildPaseoSwarmPreloadJs(): string {
     if (!msg || typeof msg !== "object") return;
     if (msg.type === "theme-change" && msg.payload) {
       applyThemeVars(msg.payload.cssVariables, msg.payload.colorScheme);
+    } else if (msg.type === "paseo-swarm-set-prefs" && msg.payload) {
+      if (typeof msg.payload.expandDoneTasks === "boolean") {
+        expandDoneTasksDefault = msg.payload.expandDoneTasks;
+        if (expandDoneTasksDefault) maybeAutoExpandDoneTasks();
+      }
     } else if (msg.type === "paseo-swarm-set-conversation" && typeof msg.conversationId === "string") {
+      if (msg.conversationId !== currentConversationId) {
+        userToggledDoneOpen = false;
+      }
       currentConversationId = msg.conversationId;
       if (window.sidecar) window.sidecar.conversationId = currentConversationId;
       try {
@@ -318,6 +373,7 @@ function buildPaseoSwarmPreloadJs(): string {
         else nextUrl.searchParams.delete("conversationId");
         window.history.replaceState(null, "", nextUrl.toString());
       } catch (e) {}
+      setTimeout(maybeAutoExpandDoneTasks, 60);
     }
   });
 

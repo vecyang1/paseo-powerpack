@@ -230,6 +230,8 @@ test("live official swarm_board bridge starts cleanly, serves Paseo preload.js a
   });
   assert.ok(preloadBody.includes("paseo-swarm-open-conversation"));
   assert.ok(preloadBody.includes("theme-change"));
+  assert.ok(preloadBody.includes('button.o2-progh[data-o2="doneOpen"]'));
+  assert.ok(preloadBody.includes("maybeAutoExpandDoneTasks"));
 });
 
 test("extractAntigravityConversationIdFromAgentDoc and buildSwarmLiveCardData handle live & replayed formats", () => {
