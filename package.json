@@ -2,7 +2,7 @@
   "name": "paseo-powerpack",
   "type": "module",
   "private": false,
-  "version": "1.9.5",
+  "version": "1.9.6",
   "description": "Paseo Powerpack (formerly File Inspector & Finder Reveal): 28+ workbench & multi-agent enhancements including Multi-Document Preview with Scroll, Grab-to-Pan Drag & Side-by-Side Compare (PDF, DOCX, XLSX, PPTX, RTF, ODT, EPUB, iWork), Task Decisions Queue (⌃⌘D), Schedule Runs History (⌘⇧H), Subagent Tree (⌘⇧B), Project Workspace Quick Switcher (Cmd+J), zero-popup inline rename (F2), Smart Clipboard Copy (⌘C), Quote Reply, Custom Voice & STT Models, and Finder reveal.",
   "license": "MIT",
   "repository": {
@@ -37,7 +37,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --import ./test/register-ts.mjs --test test/plugin.test.ts test/dictation-guard.test.ts test/model-quick-switch.test.ts test/label-quick-pick.test.ts test/project-picker-shortcut.test.ts test/sidebar-grouping-shortcut.test.ts test/sidebar-default-collapse.test.ts test/command-center-reveal-loop.test.ts test/smart-copy.test.ts test/settings-search.test.ts test/fork-session.test.ts test/agent-tool-names.test.ts test/link-first-retitle.test.ts test/quote-reply.test.ts test/sidebar-child-sessions.test.ts test/thread-shortcuts.test.ts test/commit-origin.test.ts test/session-ref-text.test.ts test/mermaid-policy.test.ts test/mermaid-enhancer.test.ts test/metro-registry.test.ts test/system-prompt.test.ts test/doc-preview.test.ts test/command-center-dedupe.test.ts test/compaction-context.test.ts test/relay-timeline-health.test.ts test/keyed-serial.test.ts test/rpc-timing.test.ts test/peer-presence.test.ts test/intake-decisions.test.ts test/pin-prefix.test.ts test/quota-queue-guard.test.ts test/quota-queue-stall-retry.test.ts"
+    "test": "node --experimental-strip-types --import ./test/register-ts.mjs --test test/plugin.test.ts test/dictation-guard.test.ts test/model-quick-switch.test.ts test/label-quick-pick.test.ts test/project-picker-shortcut.test.ts test/sidebar-grouping-shortcut.test.ts test/sidebar-default-collapse.test.ts test/command-center-reveal-loop.test.ts test/smart-copy.test.ts test/settings-search.test.ts test/fork-session.test.ts test/agent-tool-names.test.ts test/link-first-retitle.test.ts test/quote-reply.test.ts test/sidebar-child-sessions.test.ts test/thread-shortcuts.test.ts test/commit-origin.test.ts test/session-ref-text.test.ts test/mermaid-policy.test.ts test/mermaid-enhancer.test.ts test/metro-registry.test.ts test/system-prompt.test.ts test/doc-preview.test.ts test/command-center-dedupe.test.ts test/compaction-context.test.ts test/relay-timeline-health.test.ts test/keyed-serial.test.ts test/rpc-timing.test.ts test/peer-presence.test.ts test/intake-decisions.test.ts test/pin-prefix.test.ts test/quota-queue-guard.test.ts test/quota-queue-stall-retry.test.ts test/swarm-workflow.test.ts"
   },
   "dependencies": {
     "katex": "^0.19.1"

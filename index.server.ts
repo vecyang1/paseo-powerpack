@@ -34,6 +34,11 @@ import {
 } from "./shared/contracts";
 import { handleForkSession } from "./server/fork-session-handlers";
 import { handleInspectSystemPrompt } from "./server/system-prompt-handlers";
+import { inspectSwarmWorkflowRpc } from "./shared/swarm-workflow-contracts";
+import {
+  disposeSwarmBoardBridge,
+  handleInspectSwarmWorkflow,
+} from "./server/swarm-workflow-handlers";
 import {
   handleArchiveWorkspace,
   handleToggleWorkspacePin,
@@ -143,6 +148,9 @@ export default function contribute(rawServer: PluginServerContext) {
   server.handle(manageRelayHealthRpc, handleManageRelayHealth);
   server.handle(manageHarnessCatalogsRpc, handleManageHarnessCatalogs);
   server.handle(forkSessionRpc, handleForkSession);
+  server.handle(inspectSwarmWorkflowRpc, (input, context) =>
+    handleInspectSwarmWorkflow(input, context),
+  );
   server.handle(resolveCommitOriginRpc, (input) => handleResolveCommitOrigin(input));
   server.handle(inspectSystemPromptRpc, handleInspectSystemPrompt);
 
@@ -1013,6 +1021,39 @@ export default function contribute(rawServer: PluginServerContext) {
     },
   });
 
+  const finderSwarmWorkflowTool = defineAgentTool({
+    name: "finder_inspect_swarm_workflow",
+    title: "Inspect Antigravity Native Swarm Board & Run-Workflow Runs",
+    description:
+      "Inspect local Antigravity native Swarms (members, live status, board messages, live Swarm Board bridge URL) and `/run-workflow` multi-agent runs (phases, logs, child conversations). " +
+      "action=inspect_swarm_snapshot reads the active workspace/agent swarm cleanly in <5ms; action=list_swarms lists all local swarms; action=list_workflows lists `/run-workflow` runs; action=probe verifies the official swarm_board bridge. Read-only.",
+    input: z.object({
+      action: z
+        .enum([
+          "status",
+          "ensure_board_server",
+          "list_swarms",
+          "list_workflows",
+          "inspect_swarm_snapshot",
+          "probe",
+        ])
+        .optional()
+        .default("inspect_swarm_snapshot"),
+      workspaceId: z.string().optional(),
+      agentId: z.string().optional(),
+      conversationId: z.string().optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+    }),
+    async execute(input, { agent }) {
+      const res = await handleInspectSwarmWorkflow({
+        ...input,
+        workspaceId: input.workspaceId ?? agent.workspaceId ?? undefined,
+        agentId: input.agentId ?? (input.conversationId ? undefined : agent.id),
+      });
+      return { text: JSON.stringify(res, null, 2), structuredContent: res, isError: !res.ok };
+    },
+  });
+
   // No `archive_workspace` agent tool here on purpose. Paseo ships a built-in
   // tool of that name, and Paseo 0.15.3 throws in registerPluginTools when a
   // plugin tool reuses a built-in name, which fails every agent create and
@@ -1048,9 +1089,12 @@ export default function contribute(rawServer: PluginServerContext) {
         finderHarnessCatalogsTool,
         finderManagePinPrefixTool,
         finderManageQuotaQueueTool,
+        finderSwarmWorkflowTool,
       ],
     };
   });
 
-  return () => {};
+  return () => {
+    void disposeSwarmBoardBridge();
+  };
 }

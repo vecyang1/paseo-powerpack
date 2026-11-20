@@ -63,6 +63,7 @@ import { IntakeDecisionsSettingsSection } from "./intake-decisions-settings-sect
 import { MermaidSettingsSection } from "./mermaid-settings-section";
 import { ModelCatalogSettingsSection } from "./model-catalog-settings-section";
 import { RelaySettingsSection } from "./relay-settings-section";
+import { SwarmWorkflowSettingsSection } from "./swarm-workflow-settings-section";
 import {
   type ScheduleRunsDomHealthSnapshot,
   type ScheduleRunsDomSelfTestResult,
@@ -4786,6 +4787,8 @@ export function FinderPluginSettingsScreen({ theme, layout }: PluginSurfaceProps
       <ModelCatalogSettingsSection isZh={isZh} styles={styles} />
 
       <IntakeDecisionsSettingsSection isZh={isZh} styles={styles} />
+
+      <SwarmWorkflowSettingsSection isZh={isZh} styles={styles} />
 
       <SettingsSection
         title={

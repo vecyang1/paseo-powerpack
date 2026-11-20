@@ -9,6 +9,10 @@ import {
   manageSubagentsRpc,
   openFileTargetRpc,
 } from "../shared/contracts";
+import {
+  handleSwarmSidecarExternalUrl,
+  requestOpenSwarmWorkspacePanel,
+} from "./swarm-workflow-web";
 import { isChineseLocale } from "./i18n";
 import {
   buildProviderSubagentTabTestId,
@@ -327,6 +331,9 @@ export function patchPaseoSubagentTrackModules(
         url: string,
       ) {
         const rawUrl = String(url ?? "").trim();
+        if (handleSwarmSidecarExternalUrl(rawUrl)) {
+          return;
+        }
         const convMatch = rawUrl.match(/^conversation:\/\/([A-Za-z0-9-]+)/i);
         if (convMatch?.[1]) {
           const cid = convMatch[1];
@@ -360,6 +367,7 @@ const GENERIC_SUBAGENT_TYPES = new Set([
   "orchestrator",
   "agent",
   "worker",
+  "swarm worker",
 ]);
 
 const KNOWN_COORDINATOR_PREFIXES = ["DeepInvestigator", "DeepCoder"];
@@ -3913,7 +3921,12 @@ export function installDesktopSubagentsTreeEnhancer(
             pill.appendChild(dot);
 
             const txt = document.createElement("span");
-            txt.textContent = `${sub.depth >= 2 ? "↳ " : ""}L${sub.depth} ${shortLabel}`;
+            const isSwarmWorkerSub =
+              (sub.subAgentType ?? "").trim().toLowerCase() === "swarm worker" &&
+              Boolean((sub.role ?? "").trim());
+            txt.textContent = isSwarmWorkerSub
+              ? `@${(sub.role ?? "").trim().slice(0, 20)}`
+              : `${sub.depth >= 2 ? "↳ " : ""}L${sub.depth} ${shortLabel}`;
             pill.appendChild(txt);
 
             pill.addEventListener("click", (ev) => {
@@ -3987,6 +4000,42 @@ export function installDesktopSubagentsTreeEnhancer(
             marginLeft: "auto",
             flexShrink: "0",
           });
+
+          const hasSwarmWorkers = tree.flatSubagents.some(
+            (s) => (s.subAgentType ?? "").trim().toLowerCase() === "swarm worker",
+          );
+          if (hasSwarmWorkers) {
+            const swarmBoardBtn = document.createElement("button");
+            swarmBoardBtn.type = "button";
+            swarmBoardBtn.setAttribute("data-testid", "paseo-finder-open-swarm-board");
+            swarmBoardBtn.textContent = zh ? "Swarm 看板" : "Swarm Board";
+            swarmBoardBtn.title = zh
+              ? "打开此会话的原生 Antigravity Swarm 实时看板 (Board · Members · Graph · Hive)"
+              : "Open native Antigravity Swarm Board for this session";
+            Object.assign(swarmBoardBtn.style, {
+              display: "inline-flex",
+              alignItems: "center",
+              height: "24px",
+              padding: "0 9px",
+              borderRadius: "999px",
+              fontSize: "11.5px",
+              fontWeight: "600",
+              cursor: "pointer",
+              backgroundColor: tokens.surface2,
+              color: tokens.foreground,
+              border: `1px solid ${tokens.border}`,
+            });
+            swarmBoardBtn.addEventListener("click", (ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              requestOpenSwarmWorkspacePanel({
+                tab: "swarm",
+                conversationId: tree.rootConversationId,
+                workspaceId: tree.workspaceId,
+              });
+            });
+            rightControls.appendChild(swarmBoardBtn);
+          }
 
           if (allDone && !activeSub) {
             const archiveBtn = document.createElement("button");

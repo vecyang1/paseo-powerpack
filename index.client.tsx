@@ -57,6 +57,15 @@ import {
   WorkspaceFinderPanel,
   WorkspaceFinderPopover,
 } from "./client/workspace-finder";
+import { SwarmWorkflowWorkspacePanel } from "./client/swarm-panel";
+import { installSwarmLiveCard } from "./client/swarm-live-card";
+import {
+  installSwarmWorkflowDesktopBridge,
+  requestOpenSwarmWorkspacePanel,
+  subscribeWorkspaceSwarmPresence,
+  type WorkspaceSwarmPresence,
+} from "./client/swarm-workflow-web";
+import { inspectSwarmWorkflowRpc } from "./shared/swarm-workflow-contracts";
 import {
   installDesktopScheduleRunsEnhancer,
   triggerScheduleRunsDrawer,
@@ -178,6 +187,16 @@ export default function contribute(client: PluginClientContext) {
     Component: WorkspaceFinderPanel,
   });
 
+  // 3b. Register Antigravity Native Swarm Board & Run-Workflow Panel + Inline Live Swarm Card
+  client.addWorkspacePanel({
+    id: "swarm-panel",
+    title: "Swarm",
+    icon: "Network",
+    locations: ["workspace", "explorer"],
+    Component: SwarmWorkflowWorkspacePanel,
+  });
+  const uninstallSwarmLiveCard = installSwarmLiveCard(client);
+
   // 4. Register Plugin Settings & Live Diagnostic Screen
   client.addSettingsScreen({
     id: "finder-settings",
@@ -187,6 +206,29 @@ export default function contribute(client: PluginClientContext) {
   });
 
   // 5. Register Command Center (⌘K) actions
+  client.addCommandCenterItem({
+    id: "open-antigravity-swarm-board",
+    title: "Open Antigravity Swarm Board (Board · Members · Graph · Hive)",
+    icon: "Network",
+    keywords: ["swarm", "board", "graph", "hive", "antigravity", "agy", "multi-agent"],
+    context: "workspace",
+    onSelect({ openPanel }) {
+      requestOpenSwarmWorkspacePanel({ tab: "swarm" });
+      openPanel("swarm-panel", { location: "workspace" });
+    },
+  });
+
+  client.addCommandCenterItem({
+    id: "open-antigravity-workflows",
+    title: "Open Antigravity Run-Workflow Inspector (Phases · Logs · Child Agents)",
+    icon: "Workflow",
+    keywords: ["workflow", "run-workflow", "run_workflow", "phases", "antigravity", "agy"],
+    context: "workspace",
+    onSelect({ openPanel }) {
+      requestOpenSwarmWorkspacePanel({ tab: "workflows" });
+      openPanel("swarm-panel", { location: "workspace" });
+    },
+  });
   client.addCommandCenterItem({
     id: "reveal-latest-image",
     title: pluginTranslations.message("commands.revealLatestImage"),
@@ -1338,6 +1380,22 @@ export default function contribute(client: PluginClientContext) {
   // 7. Dynamically register Top-Right Workspace Header Button + Command Center (⌘K) Project Jump Items
   const headerButtons = new Map<string, PluginButtonRegistration>();
   const forkButtons = new Map<string, PluginButtonRegistration>();
+  const swarmButtons = new Map<string, PluginButtonRegistration>();
+  const workspaceSwarmPresence = new Map<string, WorkspaceSwarmPresence>();
+
+  const updateSwarmHeaderButton = (workspaceId: string) => {
+    const reg = swarmButtons.get(workspaceId);
+    if (!reg) return;
+    const info = workspaceSwarmPresence.get(workspaceId);
+    const live = Boolean(info && info.activeCount > 0);
+    reg.update({
+      visible: Boolean(info),
+      label: live ? "Swarm · Live" : "Swarm",
+      title: info
+        ? `${info.title} (${info.memberCount}m · ${info.postCount}p)`
+        : "Open Antigravity Swarm Board",
+    });
+  };
   const projectCommandCleanups = new Map<string, () => void>();
   const workspaceToProjectMap = new Map<
     string,
@@ -1544,6 +1602,36 @@ export default function contribute(client: PluginClientContext) {
           title: "Fork this session",
           icon: "Split",
           behavior: { kind: "popover", Content: ForkSessionPopover },
+        },
+      }),
+    );
+    swarmButtons.get(workspaceId)?.remove();
+    const existingSwarm = workspaceSwarmPresence.get(workspaceId);
+    const swarmLive = Boolean(existingSwarm && existingSwarm.activeCount > 0);
+    swarmButtons.set(
+      workspaceId,
+      client.addHeaderButton({
+        id: "swarm-header-btn",
+        workspaceId,
+        button: {
+          title: existingSwarm
+            ? `${existingSwarm.title} (${existingSwarm.memberCount}m · ${existingSwarm.postCount}p)`
+            : "Open Antigravity Swarm Board",
+          label: swarmLive ? "Swarm · Live" : "Swarm",
+          icon: "Network",
+          visible: Boolean(existingSwarm),
+          behavior: {
+            kind: "action",
+            onPress() {
+              const info = workspaceSwarmPresence.get(workspaceId);
+              requestOpenSwarmWorkspacePanel({
+                tab: "swarm",
+                conversationId: info?.swarmId,
+                workspaceId,
+              });
+              client.openPanel("swarm-panel", { workspaceId, location: "workspace" });
+            },
+          },
         },
       }),
     );
@@ -2017,6 +2105,50 @@ export default function contribute(client: PluginClientContext) {
     getLocale: () => client.i18n.locale,
   });
 
+  const unsubscribeSwarmPresence = subscribeWorkspaceSwarmPresence((presence) => {
+    if (!presence.workspaceId) return;
+    workspaceSwarmPresence.set(presence.workspaceId, presence);
+    updateSwarmHeaderButton(presence.workspaceId);
+  });
+
+  void client
+    .rpc(inspectSwarmWorkflowRpc, { action: "list_swarms", limit: 40 })
+    .then((res) => {
+      if (lifetime.signal.aborted) return;
+      for (const sw of res.swarms) {
+        if (!sw.paseoWorkspaceId) continue;
+        workspaceSwarmPresence.set(sw.paseoWorkspaceId, {
+          workspaceId: sw.paseoWorkspaceId,
+          swarmId: sw.swarmId,
+          title: sw.title,
+          memberCount: sw.memberCount,
+          activeCount: sw.activeCount,
+          postCount: sw.postCount,
+        });
+        updateSwarmHeaderButton(sw.paseoWorkspaceId);
+      }
+    })
+    .catch(() => {});
+
+  const cleanupSwarmWorkflowBridge = installSwarmWorkflowDesktopBridge({
+    onOpenSwarmPanel: (req) => {
+      const win = getWebWindow();
+      const targetWsId =
+        req?.workspaceId ??
+        (win?.document ? resolveCurrentActiveWorkspaceId(win.document, win, lastKnownWorkspaceId) : undefined) ??
+        lastKnownWorkspaceId;
+      if (targetWsId) {
+        client.openPanel("swarm-panel", { workspaceId: targetWsId, location: "workspace" });
+      }
+    },
+    onOpenFile: (filePath) => {
+      void client.rpc(openFileTargetRpc, {
+        path: filePath,
+        target: "system-default",
+      });
+    },
+  });
+
   client.addCommandCenterItem({
     id: "refresh-context-window-meter",
     title: "Finder: Refresh Context Window Meter",
@@ -2264,6 +2396,30 @@ export default function contribute(client: PluginClientContext) {
     },
   });
 
+  client.addSlashCommand({
+    name: "swarm-board",
+    description: "Open the live Antigravity Native Swarm Board (Overview · Board · Members · Graph · Hive)",
+    argumentHint: "[conversationId]",
+    context: "workspace",
+    onSubmit({ args, openPanel }) {
+      const cid = args.trim() || undefined;
+      requestOpenSwarmWorkspacePanel({ tab: "swarm", conversationId: cid });
+      openPanel("swarm-panel", { location: "workspace" });
+    },
+  });
+
+  client.addSlashCommand({
+    name: "workflows",
+    description: "Open the Antigravity Run-Workflow Inspector (Phases · Logs · Child Agents)",
+    argumentHint: "[conversationId]",
+    context: "workspace",
+    onSubmit({ args, openPanel }) {
+      const cid = args.trim() || undefined;
+      requestOpenSwarmWorkspacePanel({ tab: "workflows", conversationId: cid });
+      openPanel("swarm-panel", { location: "workspace" });
+    },
+  });
+
   return () => {
     lifetime.abort();
     if (syncProjectsTimer) {
@@ -2292,10 +2448,15 @@ export default function contribute(client: PluginClientContext) {
     cleanupCompactionAndContextEnhancer();
     cleanupIntakeDecisionsEnhancer();
     cleanupQuotaQueueGuard();
+    cleanupSwarmWorkflowBridge();
+    unsubscribeSwarmPresence();
+    uninstallSwarmLiveCard();
     cleanupPinTitlePrefixSync();
     for (const btn of headerButtons.values()) btn.remove();
     headerButtons.clear();
     for (const btn of forkButtons.values()) btn.remove();
     forkButtons.clear();
+    for (const btn of swarmButtons.values()) btn.remove();
+    swarmButtons.clear();
   };
 }

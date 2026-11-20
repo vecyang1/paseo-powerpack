@@ -1497,7 +1497,16 @@ async function hasTranscriptSubagentOrTimerActivity(conversationId: string): Pro
         continue;
       }
       const raw = await fs.readFile(tPath, "utf8");
-      const hasActivity = /"name"\s*:\s*"invoke_subagent"/.test(raw);
+      const swarmMembersPath = path.join(path.dirname(path.dirname(tPath)), "swarm", "members.json");
+      let hasSwarmMembers = false;
+      try {
+        await fs.access(swarmMembersPath);
+        hasSwarmMembers = true;
+      } catch {
+        hasSwarmMembers = false;
+      }
+      const hasActivity =
+        hasSwarmMembers || /"name"\s*:\s*"(?:invoke_subagent|swarm)"/.test(raw);
       TRANSCRIPT_ACTIVITY_CACHE.set(tPath, {
         mtimeMs: st.mtimeMs,
         size: st.size,
