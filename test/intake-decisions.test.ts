@@ -76,6 +76,8 @@ test("handleManageIntakeDecisions reads cached review_queue.json fast and shorte
   assert.equal(res.doneCount, 8);
   assert.equal(res.maxDecisionRounds, 6);
   assert.equal(res.maxConcurrent, 3);
+  assert.equal(res.externalScanEnabled, true);
+  assert.ok(res.includeSources.includes("github comment intake"));
   assert.equal(res.items.length, 1);
   assert.equal(res.items[0]?.shortId, "1f5a3bcb");
   assert.equal(res.items[0]?.workspaceId, "wks_29eb75f2cd6489df");
@@ -169,4 +171,66 @@ test("isIntakeDecisionsChord matches Ctrl+Cmd+D strictly without Shift or Option
     isIntakeDecisionsChord({ code: "KeyD", metaKey: true, ctrlKey: false, shiftKey: false, altKey: false }),
     false,
   );
+});
+
+test("handleManageIntakeDecisions scan_external invokes CLI with dry-run/sources and maps summary", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "paseo-intake-ext-"));
+  const intakeHome = path.join(tmpHome, ".paseo", "vec-intake");
+  fs.mkdirSync(intakeHome, { recursive: true });
+  fs.writeFileSync(
+    path.join(intakeHome, "state.json"),
+    JSON.stringify({ external_scan: { last_run_at: "2026-11-22T15:00:00.000Z" } }),
+    "utf-8",
+  );
+  fs.writeFileSync(
+    path.join(intakeHome, "review_queue.json"),
+    JSON.stringify({
+      generated_at: "2026-11-22T15:00:00.000Z",
+      total_tasks: 2,
+      actionable_blocked_count: 0,
+      superseded_duplicate_count: 0,
+      concerns_count: 0,
+      counts_by_state: { done: 2 },
+      buckets: {},
+    }),
+    "utf-8",
+  );
+
+  const recorded: Array<{ args: string[]; timeoutMs?: number }> = [];
+  const res = await handleManageIntakeDecisions(
+    { action: "scan_external", dryRun: true, sources: "github", force: true },
+    {
+      homeDir: tmpHome,
+      intakeHome,
+      exec: async (args, opts) => {
+        recorded.push({ args, timeoutMs: opts?.timeoutMs });
+        return {
+          stdout: JSON.stringify({
+            at: "2026-11-22T16:00:00.000Z",
+            dry_run: true,
+            ran: ["github"],
+            github: {
+              notifications_fetched: 12,
+              created: [{ target: "getpaseo/paseo#9395", subtype: "repro", title: "Repro #9395", url: "https://github.com/getpaseo/paseo/issues/9395" }],
+              auto_resolved: [{ target: "getpaseo/paseo#9082" }],
+              skipped: [{ target: "other#1" }],
+            },
+            email: null,
+            errors: [],
+          }),
+        };
+      },
+    },
+  );
+
+  assert.equal(recorded.length, 1);
+  assert.deepEqual(recorded[0]?.args, ["scan-external", "--sources", "github", "--json", "--dry-run", "--force"]);
+  assert.equal(recorded[0]?.timeoutMs, 45_000);
+  assert.equal(res.ok, true);
+  assert.equal(res.lastExternalScanAt, "2026-11-22T15:00:00.000Z");
+  assert.equal(res.externalScan?.githubNotifications, 12);
+  assert.equal(res.externalScan?.githubCreated, 1);
+  assert.equal(res.externalScan?.githubAutoResolved, 1);
+  assert.equal(res.externalScan?.items[0]?.target, "getpaseo/paseo#9395");
+  fs.rmSync(tmpHome, { recursive: true, force: true });
 });
