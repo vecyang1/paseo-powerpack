@@ -51,11 +51,36 @@ export const IntakeAnswerPreviewSchema = z.object({
 
 export type IntakeAnswerPreview = z.infer<typeof IntakeAnswerPreviewSchema>;
 
+export const ExternalScanItemPreviewSchema = z.object({
+  target: z.string(),
+  subtype: z.string().optional(),
+  title: z.string(),
+  url: z.string().optional(),
+  reason: z.string().optional(),
+});
+
+export const ExternalScanSummarySchema = z.object({
+  at: z.string().nullable().optional(),
+  dryRun: z.boolean(),
+  ran: z.array(z.string()),
+  githubNotifications: z.number(),
+  githubCreated: z.number(),
+  githubAutoResolved: z.number(),
+  githubSkipped: z.number(),
+  emailScanned: z.number(),
+  emailTier1: z.number(),
+  emailSpawned: z.number(),
+  errors: z.array(z.string()),
+  items: z.array(ExternalScanItemPreviewSchema),
+});
+
+export type ExternalScanSummary = z.infer<typeof ExternalScanSummarySchema>;
+
 export const manageIntakeDecisionsRpc = defineRpc({
   name: "finder.manage_intake_decisions",
   input: z.object({
     action: z
-      .enum(["list", "preview_answer", "answer", "resolve_done", "tune_config"])
+      .enum(["list", "preview_answer", "answer", "resolve_done", "tune_config", "scan_external"])
       .default("list"),
     refresh: z.boolean().optional(),
     taskId: z.string().optional(),
@@ -64,11 +89,14 @@ export const manageIntakeDecisionsRpc = defineRpc({
     configAction: z.enum(["show", "set", "reset"]).optional(),
     configKey: z.string().optional(),
     configValue: z.string().optional(),
+    dryRun: z.boolean().optional(),
+    sources: z.string().optional(),
+    force: z.boolean().optional(),
   }),
   output: z.object({
     ok: z.boolean(),
     available: z.boolean(),
-    action: z.enum(["list", "preview_answer", "answer", "resolve_done", "tune_config"]),
+    action: z.enum(["list", "preview_answer", "answer", "resolve_done", "tune_config", "scan_external"]),
     generatedAt: z.string().nullable().optional(),
     totalTasks: z.number(),
     actionableBlockedCount: z.number(),
@@ -77,6 +105,12 @@ export const manageIntakeDecisionsRpc = defineRpc({
     doneCount: z.number(),
     maxDecisionRounds: z.number(),
     maxConcurrent: z.number(),
+    externalScanEnabled: z.boolean(),
+    includeSources: z.array(z.string()),
+    githubScanIntervalMinutes: z.number(),
+    emailScanIntervalMinutes: z.number(),
+    lastExternalScanAt: z.string().nullable().optional(),
+    externalScan: ExternalScanSummarySchema.nullable().optional(),
     items: z.array(IntakeDecisionItemSchema),
     preview: IntakeAnswerPreviewSchema.nullable().optional(),
     message: z.string(),

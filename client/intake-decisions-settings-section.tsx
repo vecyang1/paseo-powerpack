@@ -111,6 +111,53 @@ export function IntakeDecisionsSettingsSection({
       .finally(() => setBusy(false));
   };
 
+  const toggleExternalScan = () => {
+    if (busy) return;
+    const next = !(snap?.externalScanEnabled ?? true);
+    setBusy(true);
+    void callDecisions({
+      action: "tune_config",
+      configAction: "set",
+      configKey: "external_scan_enabled",
+      configValue: next ? "true" : "false",
+    })
+      .then((res) => {
+        setSnap(res);
+        toast.show(
+          isZh
+            ? next
+              ? "已开启邮件与 GitHub 自动扫描修复"
+              : "已暂停邮件与 GitHub 自动扫描修复"
+            : next
+              ? "Enabled automatic email and GitHub scanning"
+              : "Paused automatic email and GitHub scanning",
+        );
+      })
+      .catch((err: unknown) => {
+        toast.show(err instanceof Error ? err.message : String(err), { variant: "error" });
+      })
+      .finally(() => setBusy(false));
+  };
+
+  const runExternalScan = (dryRun: boolean, sources: string) => {
+    if (busy) return;
+    setBusy(true);
+    void callDecisions({
+      action: "scan_external",
+      dryRun,
+      sources,
+      force: true,
+    })
+      .then((res) => {
+        setSnap(res);
+        toast.show(res.message);
+      })
+      .catch((err: unknown) => {
+        toast.show(err instanceof Error ? err.message : String(err), { variant: "error" });
+      })
+      .finally(() => setBusy(false));
+  };
+
   const toggleShortcut = () => {
     const next = !shortcutEnabled;
     writeIntakeDecisionsPrefs({ enableShortcut: next }, getWebWindow());
@@ -126,15 +173,18 @@ export function IntakeDecisionsSettingsSection({
     );
   };
 
+  const externalEnabled = snap?.externalScanEnabled ?? true;
+  const sourcesSummary = (snap?.includeSources ?? []).join(" / ") || "-";
+
   return (
     <SettingsSection
-      title={isZh ? "任务拍板与原会话续接队列" : "Task Decisions & In-Place Session Resume"}
+      title={isZh ? "任务拍板与邮件 GitHub 自动修复队列" : "Task Decisions & Auto Email/GitHub Intake"}
     >
       <View style={styles.diagBox} testID="intake-decisions-settings-card">
         <Text style={styles.label}>
           {isZh
-            ? "集中展示遇到人工阻塞节点的后台任务选项，一键拍板并直接唤醒原 Paseo 会话续跑，无需重开重复会话。"
-            : "Inspects blocked background tasks with structured options and resumes the original Paseo session in-place upon approval."}
+            ? "自动扫描邮件、GitHub 评论、PR 评审与构建失败并派发修复；遇到扣款、税务、删除或对外发信节点则汇总至拍板队列，一键确认后原会话续跑。"
+            : "Automatically scans emails, GitHub comments, PR reviews, and CI failures for autonomous fixes, while gating spend, tax, deletion, or human outreach in the 1-click decision queue."}
         </Text>
 
         <Text style={styles.detail}>
@@ -143,11 +193,25 @@ export function IntakeDecisionsSettingsSection({
             : `Pending decisions: ${snap?.actionableBlockedCount ?? 0} · Completed: ${snap?.doneCount ?? 0} · Concerns: ${snap?.concernsCount ?? 0} · Folded duplicates: ${snap?.supersededDuplicateCount ?? 0}`}
         </Text>
 
+        <Text style={styles.detail} testID="intake-external-scan-status">
+          {isZh
+            ? `邮件与 GitHub 自动扫描：${externalEnabled ? "已开启" : "已暂停"} · 周期：GitHub 每 ${snap?.githubScanIntervalMinutes ?? 15} 分钟 / 邮件每 ${snap?.emailScanIntervalMinutes ?? 120} 分钟 · 最近扫描：${snap?.lastExternalScanAt ?? "尚未运行"}`
+            : `Auto email & GitHub scan: ${externalEnabled ? "enabled" : "paused"} · Cadence: GitHub every ${snap?.githubScanIntervalMinutes ?? 15}m / Email every ${snap?.emailScanIntervalMinutes ?? 120}m · Last scan: ${snap?.lastExternalScanAt ?? "never"}`}
+        </Text>
+
         <Text style={styles.detail}>
           {isZh
-            ? `跳数熔断上限：${snap?.maxDecisionRounds ?? 8} 轮 · 并发上限：${snap?.maxConcurrent ?? 4} · 快捷键 Ctrl+Cmd+D：${shortcutEnabled ? "已开启" : "已关闭"}`
-            : `Hop breaker ceiling: ${snap?.maxDecisionRounds ?? 8} rounds · Max concurrent: ${snap?.maxConcurrent ?? 4} · Shortcut Ctrl+Cmd+D: ${shortcutEnabled ? "enabled" : "disabled"}`}
+            ? `纳入来源：${sourcesSummary} · 跳数熔断上限：${snap?.maxDecisionRounds ?? 8} 轮 · 并发上限：${snap?.maxConcurrent ?? 4} · 快捷键 Ctrl+Cmd+D：${shortcutEnabled ? "已开启" : "已关闭"}`
+            : `Included sources: ${sourcesSummary} · Hop breaker ceiling: ${snap?.maxDecisionRounds ?? 8} rounds · Max concurrent: ${snap?.maxConcurrent ?? 4} · Shortcut Ctrl+Cmd+D: ${shortcutEnabled ? "enabled" : "disabled"}`}
         </Text>
+
+        {snap?.externalScan ? (
+          <Text style={styles.detail} testID="intake-external-scan-preview">
+            {isZh
+              ? `${snap.externalScan.dryRun ? "干跑扫描结果" : "实跑扫描结果"}：GitHub 通知 ${snap.externalScan.githubNotifications} 条（待建 ${snap.externalScan.githubCreated} / 自动结案 ${snap.externalScan.githubAutoResolved} / 跳过 ${snap.externalScan.githubSkipped}）· 邮件扫描 ${snap.externalScan.emailScanned} 封（高优 ${snap.externalScan.emailTier1} / 派单 ${snap.externalScan.emailSpawned}）`
+              : `${snap.externalScan.dryRun ? "Dry-run scan" : "Live scan"}: GitHub ${snap.externalScan.githubNotifications} notifications (+${snap.externalScan.githubCreated} / auto-resolved ${snap.externalScan.githubAutoResolved} / skipped ${snap.externalScan.githubSkipped}) · Email ${snap.externalScan.emailScanned} scanned (tier1 ${snap.externalScan.emailTier1} / spawned ${snap.externalScan.emailSpawned})`}
+          </Text>
+        ) : null}
 
         {snap?.preview ? (
           <Text style={styles.detail} testID="intake-decisions-settings-preview">
@@ -168,6 +232,45 @@ export function IntakeDecisionsSettingsSection({
           >
             <Text style={styles.btnText}>
               {isZh ? "打开拍板队列 (Ctrl+Cmd+D)" : "Open Decisions Queue (Ctrl+Cmd+D)"}
+            </Text>
+          </Pressable>
+
+          <Pressable
+            style={styles.secondaryBtn}
+            disabled={busy}
+            onPress={() => runExternalScan(true, "github")}
+            testID="intake-external-dryrun-btn"
+          >
+            <Text style={styles.secondaryBtnText}>
+              {isZh ? "预演扫描 GitHub" : "Dry-Run GitHub Scan"}
+            </Text>
+          </Pressable>
+
+          <Pressable
+            style={styles.secondaryBtn}
+            disabled={busy}
+            onPress={() => runExternalScan(false, "github,email")}
+            testID="intake-external-live-btn"
+          >
+            <Text style={styles.secondaryBtnText}>
+              {isZh ? "立即扫描邮件与 GitHub" : "Scan Email & GitHub Now"}
+            </Text>
+          </Pressable>
+
+          <Pressable
+            style={styles.secondaryBtn}
+            disabled={busy}
+            onPress={toggleExternalScan}
+            testID="intake-external-toggle-btn"
+          >
+            <Text style={styles.secondaryBtnText}>
+              {isZh
+                ? externalEnabled
+                  ? "暂停自动扫描"
+                  : "开启自动扫描"
+                : externalEnabled
+                  ? "Pause Auto Scan"
+                  : "Enable Auto Scan"}
             </Text>
           </Pressable>
 

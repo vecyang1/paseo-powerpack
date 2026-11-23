@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 import type {
+  ExternalScanSummary,
   IntakeAnswerPreview,
   IntakeDecisionItem,
   IntakeDecisionOption,
@@ -13,7 +14,10 @@ import type {
 
 const execFileAsync = promisify(execFile);
 
-export type IntakeCliExec = (args: string[]) => Promise<{ stdout: string; stderr?: string }>;
+export type IntakeCliExec = (
+  args: string[],
+  opts?: { timeoutMs?: number },
+) => Promise<{ stdout: string; stderr?: string }>;
 
 export interface IntakeDecisionHandlerDeps {
   exec?: IntakeCliExec;
@@ -44,9 +48,9 @@ function defaultCliPath(homeDir: string): string {
 
 function createDefaultExec(homeDir: string): IntakeCliExec {
   const bin = defaultCliPath(homeDir);
-  return async (args: string[]) => {
+  return async (args: string[], opts?: { timeoutMs?: number }) => {
     const { stdout, stderr } = await execFileAsync(bin, ["intake", ...args], {
-      timeout: 25_000,
+      timeout: opts?.timeoutMs ?? 25_000,
       maxBuffer: 4 * 1024 * 1024,
       env: {
         ...process.env,
@@ -158,11 +162,71 @@ function flattenDigestItems(digest: Json, homeDir: string): IntakeDecisionItem[]
   return out;
 }
 
-function readLocalIntakeConfig(intakeHome: string): { maxDecisionRounds: number; maxConcurrent: number } {
+const DEFAULT_INCLUDE_SOURCES = [
+  "slack",
+  "email triage cadence",
+  "github comment intake",
+  "github ci intake",
+];
+
+function readLocalIntakeConfig(intakeHome: string): {
+  maxDecisionRounds: number;
+  maxConcurrent: number;
+  externalScanEnabled: boolean;
+  includeSources: string[];
+  githubScanIntervalMinutes: number;
+  emailScanIntervalMinutes: number;
+  lastExternalScanAt: string | null;
+} {
   const raw = readJsonFile(path.join(intakeHome, "config.json")) ?? {};
+  const stateRaw = readJsonFile(path.join(intakeHome, "state.json")) ?? {};
+  const extMeta = isRecord(stateRaw.external_scan) ? stateRaw.external_scan : null;
+  const includeSources = Array.isArray(raw.include_sources)
+    ? raw.include_sources.filter((s): s is string => typeof s === "string")
+    : DEFAULT_INCLUDE_SOURCES;
   return {
     maxDecisionRounds: asNumber(raw.max_decision_rounds, 8),
     maxConcurrent: asNumber(raw.max_concurrent, 4),
+    externalScanEnabled:
+      typeof raw.external_scan_enabled === "boolean" ? raw.external_scan_enabled : true,
+    includeSources,
+    githubScanIntervalMinutes: asNumber(raw.github_scan_interval_minutes, 15),
+    emailScanIntervalMinutes: asNumber(raw.email_scan_interval_minutes, 120),
+    lastExternalScanAt:
+      asString(extMeta?.last_run_at) || asString(extMeta?.last_github_at) || null,
+  };
+}
+
+function mapExternalScanSummary(raw: Json): ExternalScanSummary {
+  const gh = isRecord(raw.github) ? raw.github : {};
+  const em = isRecord(raw.email) ? raw.email : {};
+  const ghCreated = Array.isArray(gh.created) ? gh.created : [];
+  const ghResolved = Array.isArray(gh.auto_resolved) ? gh.auto_resolved : [];
+  const ghSkipped = Array.isArray(gh.skipped) ? gh.skipped : [];
+  const items: ExternalScanSummary["items"] = [];
+  for (const row of ghCreated.slice(0, 8)) {
+    if (!isRecord(row)) continue;
+    items.push({
+      target: asString(row.target),
+      subtype: asString(row.subtype) || undefined,
+      title: asString(row.title),
+      url: asString(row.url) || undefined,
+      reason: asString(row.reason) || undefined,
+    });
+  }
+  return {
+    at: asString(raw.at) || null,
+    dryRun: Boolean(raw.dry_run),
+    ran: Array.isArray(raw.ran) ? raw.ran.filter((x): x is string => typeof x === "string") : [],
+    githubNotifications: asNumber(gh.notifications_fetched, 0),
+    githubCreated: ghCreated.length,
+    githubAutoResolved: ghResolved.length,
+    githubSkipped: ghSkipped.length,
+    emailScanned: asNumber(em.scanned, 0),
+    emailTier1: asNumber(em.tier1_count, 0),
+    emailSpawned: asNumber(em.spawned_count, 0),
+    errors: Array.isArray(raw.errors) ? raw.errors.filter((x): x is string => typeof x === "string") : [],
+    items,
   };
 }
 
@@ -227,10 +291,34 @@ export async function handleManageIntakeDecisions(
   };
 
   let preview: IntakeAnswerPreview | null = null;
+  let externalScan: ExternalScanSummary | null = null;
   let actionMessage = "";
   let actionOk = true;
 
-  if (action === "tune_config") {
+  if (action === "scan_external") {
+    const sources = (input.sources ?? "github").trim() || "github";
+    const dryRun = input.dryRun !== false;
+    const args = ["scan-external", "--sources", sources, "--json"];
+    if (dryRun) args.push("--dry-run");
+    if (input.force !== false) args.push("--force");
+    const timeoutMs = sources.includes("email") ? 150_000 : 45_000;
+    try {
+      const { stdout } = await exec(args, { timeoutMs });
+      const parsed = parseJsonObject(stdout);
+      if (parsed) {
+        externalScan = mapExternalScanSummary(parsed);
+        actionOk = externalScan.errors.length === 0;
+        const prefix = dryRun ? "Dry-run scan" : "Live scan";
+        actionMessage = `${prefix}: GitHub +${externalScan.githubCreated}/-${externalScan.githubAutoResolved}, Email scanned=${externalScan.emailScanned} (+${externalScan.emailSpawned})`;
+      } else {
+        actionOk = false;
+        actionMessage = "Failed to parse external scan output";
+      }
+    } catch (err) {
+      actionOk = false;
+      actionMessage = err instanceof Error ? err.message : String(err);
+    }
+  } else if (action === "tune_config") {
     const cfgAct = input.configAction ?? "show";
     const args = ["config", cfgAct];
     if (cfgAct === "set" && input.configKey && input.configValue !== undefined) {
@@ -251,6 +339,7 @@ export async function handleManageIntakeDecisions(
   } else if (action === "preview_answer" || action === "answer" || action === "resolve_done") {
     const target = (input.taskId ?? "").trim();
     if (!target) {
+      const fallbackCfg = readLocalIntakeConfig(intakeHome);
       return {
         ok: false,
         available: true,
@@ -260,8 +349,14 @@ export async function handleManageIntakeDecisions(
         supersededDuplicateCount: 0,
         concernsCount: 0,
         doneCount: 0,
-        maxDecisionRounds: 8,
-        maxConcurrent: 4,
+        maxDecisionRounds: fallbackCfg.maxDecisionRounds,
+        maxConcurrent: fallbackCfg.maxConcurrent,
+        externalScanEnabled: fallbackCfg.externalScanEnabled,
+        includeSources: fallbackCfg.includeSources,
+        githubScanIntervalMinutes: fallbackCfg.githubScanIntervalMinutes,
+        emailScanIntervalMinutes: fallbackCfg.emailScanIntervalMinutes,
+        lastExternalScanAt: fallbackCfg.lastExternalScanAt,
+        externalScan: null,
         items: [],
         preview: null,
         message: "Missing taskId",
@@ -313,6 +408,12 @@ export async function handleManageIntakeDecisions(
       doneCount: 0,
       maxDecisionRounds: cfg.maxDecisionRounds,
       maxConcurrent: cfg.maxConcurrent,
+      externalScanEnabled: cfg.externalScanEnabled,
+      includeSources: cfg.includeSources,
+      githubScanIntervalMinutes: cfg.githubScanIntervalMinutes,
+      emailScanIntervalMinutes: cfg.emailScanIntervalMinutes,
+      lastExternalScanAt: cfg.lastExternalScanAt,
+      externalScan,
       items: [],
       preview,
       message: actionMessage || (available ? "Decision queue empty" : "Intake router not configured on this host"),
@@ -336,6 +437,12 @@ export async function handleManageIntakeDecisions(
     doneCount: asNumber(counts.done, 0),
     maxDecisionRounds: cfg.maxDecisionRounds,
     maxConcurrent: cfg.maxConcurrent,
+    externalScanEnabled: cfg.externalScanEnabled,
+    includeSources: cfg.includeSources,
+    githubScanIntervalMinutes: cfg.githubScanIntervalMinutes,
+    emailScanIntervalMinutes: cfg.emailScanIntervalMinutes,
+    lastExternalScanAt: cfg.lastExternalScanAt,
+    externalScan,
     items,
     preview,
     message: actionMessage || `${actionableCount} pending decisions`,

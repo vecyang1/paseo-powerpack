@@ -136,6 +136,21 @@ async function main() {
     await sleep(500);
     check("Settings screen renders Task Decisions & In-Place Session Resume reconciler", true);
 
+    const extStatusTxt = await page.textContent('[data-testid="intake-external-scan-status"]');
+    check(
+      "Settings card shows auto email & GitHub scan status",
+      Boolean(extStatusTxt && /GitHub/i.test(extStatusTxt)),
+      extStatusTxt ?? "",
+    );
+
+    const hasDryRunBtn = (await page.locator('[data-testid="intake-external-dryrun-btn"]').count()) > 0;
+    const hasToggleBtn = (await page.locator('[data-testid="intake-external-toggle-btn"]').count()) > 0;
+    check(
+      "Settings card exposes external scan Try & Tune controls",
+      hasDryRunBtn && hasToggleBtn,
+      `dryRunBtn=${hasDryRunBtn} toggleBtn=${hasToggleBtn}`,
+    );
+
     const settingsShot = path.join(SHOTS, "intake-decisions-settings.png");
     await page.screenshot({ path: settingsShot });
     console.log(`Saved screenshot: ${settingsShot}`);
