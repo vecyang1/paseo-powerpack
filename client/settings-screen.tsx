@@ -60,6 +60,7 @@ import {
 } from "../shared/peer-presence-format";
 import { DocPreviewSettingsSection } from "./doc-settings-section";
 import { IntakeDecisionsSettingsSection } from "./intake-decisions-settings-section";
+import { MultiModelRaceSettingsSection } from "./multi-model-race-settings-section";
 import { MermaidSettingsSection } from "./mermaid-settings-section";
 import { ModelCatalogSettingsSection } from "./model-catalog-settings-section";
 import { RelaySettingsSection } from "./relay-settings-section";
@@ -4823,6 +4824,8 @@ export function FinderPluginSettingsScreen({ theme, layout }: PluginSurfaceProps
       <ModelCatalogSettingsSection isZh={isZh} styles={styles} />
 
       <IntakeDecisionsSettingsSection isZh={isZh} styles={styles} />
+
+      <MultiModelRaceSettingsSection isZh={isZh} styles={styles} />
 
       <SwarmWorkflowSettingsSection isZh={isZh} styles={styles} />
 

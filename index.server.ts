@@ -100,6 +100,12 @@ import { handleManageIntakeDecisions } from "./server/intake-decisions-handlers"
 import { manageQuotaQueueRpc } from "./shared/quota-queue-contracts";
 import { handleManageQuotaQueue } from "./server/quota-queue-handlers";
 import { withRpcTiming } from "./server/rpc-timing";
+import {
+  RaceContenderSpecSchema,
+  RaceIsolationSchema,
+  manageMultiModelRaceRpc,
+} from "./shared/multi-model-race-contracts";
+import { handleManageMultiModelRace } from "./server/multi-model-race-handlers";
 
 export default function contribute(rawServer: PluginServerContext) {
   // Slow RPCs are logged with their method name (server/rpc-timing.ts).
@@ -110,6 +116,9 @@ export default function contribute(rawServer: PluginServerContext) {
   server.handle(inspectAntigravityContextRpc, (input) => handleInspectAntigravityContext(input));
   server.handle(manageIntakeDecisionsRpc, (input) => handleManageIntakeDecisions(input));
   server.handle(manageQuotaQueueRpc, (input, context) => handleManageQuotaQueue(input, context));
+  server.handle(manageMultiModelRaceRpc, (input, context) =>
+    handleManageMultiModelRace(input, { paseo: context.paseo }),
+  );
   server.handle(previewDocumentRpc, handlePreviewDocument);
   server.handle(listSiblingDocumentsRpc, handleListSiblingDocuments);
   server.handle(diagnoseDocPreviewRpc, handleDiagnoseDocPreview);
@@ -1054,6 +1063,35 @@ export default function contribute(rawServer: PluginServerContext) {
     },
   });
 
+  const finderMultiModelRaceTool = defineAgentTool({
+    name: "finder_multi_model_race",
+    description:
+      "Inspect, dry-run, launch, or archive Multi-Model Parallel Worktree Races (1 prompt dispatched across 2+ models/profiles in isolated worktrees).",
+    input: z.object({
+      action: z.enum(["status", "dry_run", "launch", "inspect", "archive_losers", "configure", "reset"]),
+      cwd: z.string().optional(),
+      prompt: z.string().optional(),
+      title: z.string().optional(),
+      isolation: RaceIsolationSchema.optional(),
+      baseRef: z.string().optional(),
+      branchPrefix: z.string().optional(),
+      contenders: z.array(RaceContenderSpecSchema).optional(),
+      raceId: z.string().optional(),
+      winnerWorkspaceId: z.string().optional(),
+      archiveAll: z.boolean().optional(),
+    }),
+    async execute(input, context) {
+      const res = await handleManageMultiModelRace(
+        {
+          ...input,
+          createdBy: "agent",
+        },
+        { paseo: context.paseo },
+      );
+      return { text: JSON.stringify(res, null, 2), structuredContent: res, isError: !res.ok };
+    },
+  });
+
   // No `archive_workspace` agent tool here on purpose. Paseo ships a built-in
   // tool of that name, and Paseo 0.15.3 throws in registerPluginTools when a
   // plugin tool reuses a built-in name, which fails every agent create and
@@ -1090,6 +1128,7 @@ export default function contribute(rawServer: PluginServerContext) {
         finderManagePinPrefixTool,
         finderManageQuotaQueueTool,
         finderSwarmWorkflowTool,
+        finderMultiModelRaceTool,
       ],
     };
   });
