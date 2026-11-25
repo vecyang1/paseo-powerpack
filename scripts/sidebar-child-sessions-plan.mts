@@ -15,6 +15,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {
+  compareSessionBrands,
+  type BrandComparisonResult,
+} from "../shared/model-brand-icons.ts";
 import { planChildSessions, readParentAgentId, type ChildSessionAgent } from "../shared/sidebar-child-sessions.ts";
 
 const args = process.argv.slice(2);
@@ -40,6 +44,13 @@ for (const bucket of fs.existsSync(agentsDir) ? fs.readdirSync(agentsDir) : []) 
     if (!f.endsWith(".json")) continue;
     const rec = readJson(path.join(dir, f));
     if (!rec?.id || rec.internal || rec.labels?.["paseo.internal"] === "true") continue;
+    const recCfg = rec.config && typeof rec.config === "object" ? rec.config : null;
+    const recRt = rec.runtimeInfo && typeof rec.runtimeInfo === "object" ? rec.runtimeInfo : null;
+    const recModel =
+      (typeof recRt?.model === "string" && recRt.model.trim()) ||
+      (typeof recCfg?.model === "string" && recCfg.model.trim()) ||
+      (typeof rec.model === "string" && rec.model.trim()) ||
+      null;
     agents.push({
       id: rec.id,
       workspaceId: rec.workspaceId ?? null,
@@ -48,8 +59,11 @@ for (const bucket of fs.existsSync(agentsDir) ? fs.readdirSync(agentsDir) : []) 
       title: rec.title ?? null,
       status: rec.lastStatus ?? null,
       requiresAttention: Boolean(rec.requiresAttention),
+      attentionReason: typeof rec.attentionReason === "string" ? rec.attentionReason : null,
       createdAt: rec.createdAt ?? null,
       lastActivityAt: rec.lastActivityAt ?? rec.updatedAt ?? null,
+      provider: typeof rec.provider === "string" ? rec.provider : null,
+      model: recModel,
     });
   }
 }
@@ -71,17 +85,53 @@ const byId = new Map(agents.map((a) => [a.id, a]));
 const titleOf = (id: string) => byId.get(id)?.title || id.slice(0, 8);
 const wsName = (id: string) => wsTitle.get(id) ?? id;
 
+const brandInfo = (
+  childProvider?: string | null,
+  childModel?: string | null,
+  parentProvider?: string | null,
+  parentModel?: string | null,
+): BrandComparisonResult =>
+  compareSessionBrands(
+    { provider: childProvider, model: childModel },
+    { provider: parentProvider, model: parentModel },
+  );
+
 const nested = [...plan.childWorkspaces.values()].map((l) => ({
   workspaceId: l.workspaceId,
   workspace: wsName(l.workspaceId),
   parentWorkspaceId: l.parentWorkspaceId,
   parentWorkspace: wsName(l.parentWorkspaceId),
-  sessions: l.links.map((x) => ({ agentId: x.agentId, title: titleOf(x.agentId), parentAgentId: x.parentAgentId })),
+  sessions: (l.linkRows ?? []).map((x) => {
+    const cmp = brandInfo(x.provider, x.model, x.parentProvider, x.parentModel);
+    return {
+      agentId: x.agentId,
+      title: titleOf(x.agentId),
+      parentAgentId: x.parentAgentId,
+      provider: x.provider ?? null,
+      model: x.model ?? null,
+      brand: cmp.child.brand,
+      modelSummary: cmp.child.summary,
+      differsFromParent: cmp.differsBrand || cmp.differsCompany,
+    };
+  }),
 }));
 const tabs = [...plan.tabChildren.entries()].map(([ws, rows]) => ({
   workspaceId: ws,
   workspace: wsName(ws),
-  rows: rows.map((r) => ({ agentId: r.agentId, title: r.title, depth: r.depth, parentAgentId: r.parentAgentId })),
+  rows: rows.map((r) => {
+    const cmp = brandInfo(r.provider, r.model, r.parentProvider, r.parentModel);
+    return {
+      agentId: r.agentId,
+      title: r.title,
+      depth: r.depth,
+      parentAgentId: r.parentAgentId,
+      provider: r.provider ?? null,
+      model: r.model ?? null,
+      brand: cmp.child.brand,
+      modelSummary: cmp.child.summary,
+      differsFromParent: cmp.differsBrand || cmp.differsCompany,
+    };
+  }),
 }));
 const skipped = plan.skipped.map((s) => ({ ...s, title: titleOf(s.agentId) }));
 
@@ -111,9 +161,18 @@ if (JSON_OUT) {
   console.log(JSON.stringify({ nested, tabs, skipped }, null, 2));
 } else {
   console.log(`Nested workspaces (${nested.length})`);
-  for (const n of nested) console.log(`  ${n.workspace}  <-  ${n.parentWorkspace}  [${n.sessions.map((s) => s.agentId.slice(0, 8)).join(", ")}]`);
+  for (const n of nested) {
+    const tags = n.sessions
+      .map((s) => `${s.agentId.slice(0, 8)}:${s.modelSummary}${s.differsFromParent ? " *" : ""}`)
+      .join(", ");
+    console.log(`  ${n.workspace}  <-  ${n.parentWorkspace}  [${tags}]`);
+  }
   console.log(`Tab sub-sessions (${tabs.reduce((a, t) => a + t.rows.length, 0)} in ${tabs.length} workspaces)`);
-  for (const t of tabs) for (const r of t.rows) console.log(`  ${t.workspace}  ${"  ".repeat(r.depth - 1)}└ ${r.title} #${r.agentId.slice(0, 8)}`);
+  for (const t of tabs) {
+    for (const r of t.rows) {
+      console.log(`  ${t.workspace}  ${"  ".repeat(r.depth - 1)}└ [${r.modelSummary}${r.differsFromParent ? " *" : ""}] ${r.title} #${r.agentId.slice(0, 8)}`);
+    }
+  }
   console.log(`Started by a session but kept at top level (${skipped.length})`);
   for (const s of skipped) console.log(`  ${s.title} #${s.agentId.slice(0, 8)}: ${s.reason}`);
 }

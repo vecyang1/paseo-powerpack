@@ -40,6 +40,7 @@ What [@vecyang1](https://github.com/vecyang1) has sent upstream to [getpaseo/pas
 
 | # | Title | Votes | Replies | Opened |
 |---|---|---|---|---|
+| [#10756](https://github.com/getpaseo/paseo/discussions/10756) | Sidebar sub-sessions: show model-company brand icon when a sub-session uses a different model/provider | 1 | 0 | 2026-11-25 |
 | [#10311](https://github.com/getpaseo/paseo/discussions/10311) | Antigravity provider: native /swarm live board (swarm_board sidecar), inline progress card, and Swarm Worker subagents | 1 | 0 | 2026-11-20 |
 | [#10303](https://github.com/getpaseo/paseo/discussions/10303) | Markdown tables: horizontal drag-and-drop column reordering (with edge auto-scroll) and column resizing | 1 | 0 | 2026-11-20 |
 | [#10288](https://github.com/getpaseo/paseo/discussions/10288) | File pane: show clickable file path breadcrumb bar directly under the file toolbar | 1 | 0 | 2026-11-20 |
@@ -79,3 +80,4 @@ What [@vecyang1](https://github.com/vecyang1) has sent upstream to [getpaseo/pas
 | `retry_loop_guard` | Surface live consecutive Antigravity API errors as throttled session.notice items and abort stuck /goal stop-hook or prolonged error retry loops cleanly. | [#10196](https://github.com/getpaseo/paseo/issues/10196) | #10196 closed |
 | `claude_workflow_progress_card` | Claude Workflow runs show live phases, agents, tokens and latest step in place of the Workflow card (delivered in file-inspector-finder, read from Claude's run files). | [#10263](https://github.com/getpaseo/paseo/issues/10263) | #10263 open |
 | `antigravity_native_swarm_board` | Native Antigravity /swarm & /run-workflow passthrough, <PASEO_SWARM_BOARD> coordinator awareness, members.json Swarm Worker (<role>) subagents with swarm_wait idle state, and zero-copy swarm_board proxy + live timeline card (delivered in file-inspector-finder v1.9.6). | [Discussion #10311](https://github.com/getpaseo/paseo/discussions/10311) | #10311 open |
+| `subsession_model_brand_icons` | Show model-company brand icons (`shared/model-brand-icons.ts` + `client/model-brand-icon-web.ts`) on sidebar sub-session rows, moved cross-model child workspaces, colleague/lineage pills, and inline session mentions (`Always / Different from parent / Off` in Settings; model-company-first inference so Claude Opus via Antigravity still renders Claude's mark). | [Discussion #10756](https://github.com/getpaseo/paseo/discussions/10756) | #10756 open |

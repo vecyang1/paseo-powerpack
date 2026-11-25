@@ -34,6 +34,14 @@
  * from disk with `scripts/sidebar-child-sessions-plan.mts`.
  */
 import {
+  DEFAULT_SUBSESSION_MODEL_ICON_MODE,
+  compareSessionBrands,
+  normalizeSubsessionModelIconMode,
+  shouldShowModelBrandIcon,
+  type ModelBrandId,
+  type SubsessionModelIconMode,
+} from "../shared/model-brand-icons";
+import {
   childWorkspaceDepth,
   orderSidebarRows,
   planChildSessions,
@@ -42,6 +50,10 @@ import {
   type ChildSessionSkip,
   type TabChildRow,
 } from "../shared/sidebar-child-sessions";
+import {
+  MODEL_BRAND_ICON_TESTID,
+  createModelBrandIconElement,
+} from "./model-brand-icon-web";
 import {
   extractCurrentWorkspaceAndAgent,
   getMetroModuleList,
@@ -53,6 +65,8 @@ export interface SidebarChildSessionsPrefs {
   enabled: boolean;
   /** Also list children that run as tabs in their parent's workspace. */
   tabChildren: boolean;
+  /** Show model-company brand icon on sub-sessions (always | different | off). */
+  modelIcons?: SubsessionModelIconMode;
 }
 
 export interface NestedWorkspaceStatus {
@@ -63,6 +77,9 @@ export interface NestedWorkspaceStatus {
   depth: number;
   /** null = one of the two rows is not on screen (collapsed project, hidden sidebar). */
   onScreen: boolean;
+  brand?: ModelBrandId;
+  modelSummary?: string;
+  differsFromParent?: boolean;
 }
 
 export interface SidebarChildSessionsStatus {
@@ -71,7 +88,13 @@ export interface SidebarChildSessionsStatus {
   storeFound: boolean;
   renderedAt: string | null;
   nested: NestedWorkspaceStatus[];
-  tabRows: Array<{ workspaceId: string; title: string; count: number; onScreen: boolean }>;
+  tabRows: Array<{
+    workspaceId: string;
+    title: string;
+    count: number;
+    onScreen: boolean;
+    crossModelCount?: number;
+  }>;
   skipped: Array<ChildSessionSkip & { title: string }>;
   cssRules: number;
   /** Last render's cost; renders run on store updates (throttled) and on sidebar list changes. */
@@ -80,6 +103,8 @@ export interface SidebarChildSessionsStatus {
   suspendedList: string | null;
   /** Paseo's `navigateToAgent` was found (tab rows open through it). */
   nativeNavigation: boolean;
+  crossModelCount?: number;
+  modelIconsShown?: number;
 }
 
 export interface SidebarChildSessionsCheck {
@@ -92,6 +117,7 @@ export const SIDEBAR_CHILD_SESSIONS_EVENT = "paseo-finder:sidebar-child-sessions
 export const ROW_PREFIX = "sidebar-workspace-row-";
 export const TAB_BLOCK_TESTID = "paseo-finder-sidebar-child-rows";
 export const TAB_ROW_TESTID = "paseo-finder-sidebar-child-row";
+export const MOVED_BRAND_BADGE_TESTID = "paseo-finder-moved-child-brand";
 const STYLE_ID = "paseo-finder-sidebar-child-sessions-style";
 const PREFS_KEY = "paseo:finder-plugin:sidebar-child-sessions";
 const LIST_SELECTOR =
@@ -106,7 +132,11 @@ const DRAG_START_PX = 6;
 const INDENT_PX = 22;
 const CONNECTOR_X_PX = 16;
 
-const DEFAULT_PREFS: SidebarChildSessionsPrefs = { enabled: true, tabChildren: true };
+const DEFAULT_PREFS: SidebarChildSessionsPrefs = {
+  enabled: true,
+  tabChildren: true,
+  modelIcons: DEFAULT_SUBSESSION_MODEL_ICON_MODE,
+};
 
 // ---------------------------------------------------------------------------
 // Prefs
@@ -124,7 +154,11 @@ export function readSidebarChildSessionsPrefs(): SidebarChildSessionsPrefs {
   try {
     const raw = storage()?.getItem(PREFS_KEY);
     const value = raw ? (JSON.parse(raw) as Partial<SidebarChildSessionsPrefs>) : {};
-    return { enabled: value.enabled !== false, tabChildren: value.tabChildren !== false };
+    return {
+      enabled: value.enabled !== false,
+      tabChildren: value.tabChildren !== false,
+      modelIcons: normalizeSubsessionModelIconMode(value.modelIcons),
+    };
   } catch {
     return { ...DEFAULT_PREFS };
   }
@@ -133,13 +167,25 @@ export function readSidebarChildSessionsPrefs(): SidebarChildSessionsPrefs {
 export function syncSidebarChildSessionsPrefs(
   prefs: Partial<SidebarChildSessionsPrefs>,
 ): SidebarChildSessionsPrefs {
-  const next = { ...readSidebarChildSessionsPrefs(), ...prefs };
+  const prev = readSidebarChildSessionsPrefs();
+  const next: SidebarChildSessionsPrefs = {
+    ...prev,
+    ...prefs,
+    modelIcons: normalizeSubsessionModelIconMode(prefs.modelIcons ?? prev.modelIcons),
+  };
   try {
     storage()?.setItem(PREFS_KEY, JSON.stringify(next));
   } catch {
     // Ignore storage errors
   }
   activeHandle?.renderNow();
+  if (typeof window !== "undefined") {
+    try {
+      window.dispatchEvent(new CustomEvent(SIDEBAR_CHILD_SESSIONS_EVENT));
+    } catch {
+      // Ignore event errors
+    }
+  }
   return next;
 }
 
@@ -228,20 +274,30 @@ export function snapshotSessionStore(store: SessionStoreLike | null): StoreSnaps
   const sessions = store.getState()?.sessions ?? {};
   return Object.entries(sessions).map(([serverId, session]) => {
     const agents = mapValues<Record<string, any>>(session.agents).map(
-      (a): ChildSessionAgent => ({
-        id: String(a.id ?? ""),
-        workspaceId: a.workspaceId ? String(a.workspaceId) : null,
-        parentAgentId: typeof a.parentAgentId === "string" ? a.parentAgentId : null,
-        labels: a.labels ?? null,
-        archivedAt: a.archivedAt ?? null,
-        title: typeof a.title === "string" ? a.title : null,
-        status: typeof a.status === "string" ? a.status : null,
-        running: a.turn?.phase === "open",
-        requiresAttention: Boolean(a.requiresAttention),
-        pendingPermissionCount: Array.isArray(a.pendingPermissions) ? a.pendingPermissions.length : 0,
-        createdAt: a.createdAt ?? null,
-        lastActivityAt: a.lastActivityAt ?? null,
-      }),
+      (a): ChildSessionAgent => {
+        const runtimeModel =
+          typeof a.runtimeInfo?.model === "string" ? a.runtimeInfo.model.trim() : "";
+        const directModel = typeof a.model === "string" ? a.model.trim() : "";
+        const cfgModel =
+          typeof a.config?.model === "string" ? a.config.model.trim() : "";
+        return {
+          id: String(a.id ?? ""),
+          workspaceId: a.workspaceId ? String(a.workspaceId) : null,
+          parentAgentId: typeof a.parentAgentId === "string" ? a.parentAgentId : null,
+          labels: a.labels ?? null,
+          archivedAt: a.archivedAt ?? null,
+          title: typeof a.title === "string" ? a.title : null,
+          status: typeof a.status === "string" ? a.status : null,
+          running: a.turn?.phase === "open",
+          requiresAttention: Boolean(a.requiresAttention),
+          attentionReason: typeof a.attentionReason === "string" ? a.attentionReason : null,
+          pendingPermissionCount: Array.isArray(a.pendingPermissions) ? a.pendingPermissions.length : 0,
+          createdAt: a.createdAt ?? null,
+          lastActivityAt: a.lastActivityAt ?? null,
+          provider: typeof a.provider === "string" ? a.provider.trim() || null : null,
+          model: runtimeModel || directModel || cfgModel || null,
+        };
+      },
     );
     const workspaces = mapValues<Record<string, any>>(session.workspaces);
     const workspaceTitles = new Map<string, string>();
@@ -299,28 +355,38 @@ function relativeAge(ms: number | null, now: number): string {
 
 interface ThemeColors {
   name: string;
+  colorScheme?: "light" | "dark";
   fg: string;
   muted: string;
   extraMuted: string;
   border: string;
   hover: string;
   selected: string;
+  surfaceSidebar?: string;
+  surface1?: string;
   running: string;
+  success?: string;
   warning: string;
+  danger?: string;
 }
 
 function themeColors(doc: Document, win: Window): ThemeColors {
   const t = resolveActivePaseoTheme(doc as never, win as never);
   return {
     name: t.name,
+    colorScheme: t.colorScheme,
     fg: t.foreground,
     muted: t.foregroundMuted,
     extraMuted: t.foregroundExtraMuted,
     border: t.border,
     hover: t.surfaceSidebarHover,
     selected: t.surfaceSidebarSelected,
+    surfaceSidebar: t.surfaceSidebar,
+    surface1: t.surface1,
     running: t.statusDotRunning,
+    success: t.statusSuccess,
     warning: t.statusWarning,
+    danger: t.statusDanger,
   };
 }
 
@@ -328,7 +394,7 @@ function baseCss(c: ThemeColors): string {
   const tab = `[data-testid="${TAB_ROW_TESTID}"]`;
   return [
     `[data-testid="${TAB_BLOCK_TESTID}"]{display:flex;flex-direction:column;position:relative;}`,
-    `${tab}{all:unset;box-sizing:border-box;position:relative;display:flex;align-items:center;gap:9px;height:32px;padding:0 12px 0 8px;border-radius:8px;cursor:pointer;color:${c.fg};font:400 14px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}`,
+    `${tab}{all:unset;box-sizing:border-box;position:relative;display:flex;align-items:center;gap:8px;height:32px;padding:0 12px 0 8px;border-radius:8px;cursor:pointer;color:${c.fg};font:400 14px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}`,
     `${tab}:hover{background:${c.hover};}`,
     `${tab}[aria-current="true"]{background:${c.selected};font-weight:500;}`,
     `${tab}:focus-visible{outline:2px solid ${c.running};outline-offset:-2px;}`,
@@ -336,9 +402,11 @@ function baseCss(c: ThemeColors): string {
     `${tab} .pff-dot::after{content:"";width:6px;height:6px;border-radius:50%;background:${c.extraMuted};}`,
     `${tab}[data-state="running"] .pff-dot::after{width:6px;height:6px;border:2px solid ${c.running};background:transparent;}`,
     `${tab}[data-state="attention"] .pff-dot::after{background:${c.warning};}`,
+    `${tab}:hover .pff-brand-icon,${tab}[aria-current="true"] .pff-brand-icon{opacity:1 !important;}`,
     `${tab} .pff-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}`,
     `${tab} .pff-age{flex:0 0 auto;font-size:12px;color:${c.muted};}`,
     `${tab}[data-more="true"]{color:${c.muted};font-size:13px;}`,
+    `[data-testid="${MOVED_BRAND_BADGE_TESTID}"]{position:absolute;top:21px;z-index:2;display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:999px;background:${c.surfaceSidebar ?? c.hover};box-shadow:0 0 0 1.5px ${c.surfaceSidebar ?? c.hover};pointer-events:none;}`,
     // Connector: "╰" from the parent's status icon down into this row.
     `.pff-elbow{position:absolute;top:-3px;height:calc(50% + 3px);width:6px;border-left:1px solid ${c.border};border-bottom:1px solid ${c.border};border-bottom-left-radius:6px;pointer-events:none;}`,
     `.pff-stem{position:absolute;top:50%;bottom:0;border-left:1px solid ${c.border};pointer-events:none;}`,
@@ -363,11 +431,19 @@ function connectorCss(selector: string, depth: number, hasNext: boolean, c: Them
 // Render
 // ---------------------------------------------------------------------------
 
+interface MovedWorkspaceBadgePlan {
+  key: string;
+  workspaceId: string;
+  depth: number;
+  row: TabChildRow;
+}
+
 interface RenderResult {
   css: string;
   cssRules: number;
   nested: NestedWorkspaceStatus[];
   tabBlocks: Array<{ key: string; workspaceId: string; rows: TabChildRow[]; hasMovedChildren: boolean }>;
+  movedBadges: MovedWorkspaceBadgePlan[];
 }
 
 /**
@@ -384,6 +460,7 @@ export function planSidebarLayout(
   const rules: string[] = [baseCss(colors)];
   const nested: NestedWorkspaceStatus[] = [];
   const tabBlocks: RenderResult["tabBlocks"] = [];
+  const movedBadges: MovedWorkspaceBadgePlan[] = [];
   const planByServer = new Map(plans.map((p) => [p.serverId, p]));
 
   const parentKeyOf = (key: string): string | null => {
@@ -449,13 +526,35 @@ export function planSidebarLayout(
     for (const [wsId, link] of plan.childWorkspaces) {
       const key = `${serverId}:${wsId}`;
       const parentKey = `${serverId}:${link.parentWorkspaceId}`;
+      const visibleHere = onScreen.has(key) && onScreen.has(parentKey);
+      const primaryRow = link.linkRows?.[0];
+      const brandComparison = primaryRow
+        ? compareSessionBrands(
+            { provider: primaryRow.provider, model: primaryRow.model },
+            { provider: primaryRow.parentProvider, model: primaryRow.parentModel },
+          )
+        : null;
+      const depth = childWorkspaceDepth(plan, wsId);
+      if (visibleHere && primaryRow) {
+        movedBadges.push({
+          key,
+          workspaceId: wsId,
+          depth: Math.max(1, depth),
+          row: primaryRow,
+        });
+      }
       nested.push({
         workspaceId: wsId,
         parentWorkspaceId: link.parentWorkspaceId,
         title: titles.get(wsId) ?? wsId,
         parentTitle: titles.get(link.parentWorkspaceId) ?? link.parentWorkspaceId,
-        depth: childWorkspaceDepth(plan, wsId),
-        onScreen: onScreen.has(key) && onScreen.has(parentKey),
+        depth,
+        onScreen: visibleHere,
+        brand: brandComparison?.child.brand,
+        modelSummary: brandComparison?.child.summary,
+        differsFromParent: Boolean(
+          brandComparison && (brandComparison.differsBrand || brandComparison.differsCompany),
+        ),
       });
     }
     if (!prefs.tabChildren) continue;
@@ -469,7 +568,21 @@ export function planSidebarLayout(
   }
 
   const css = rules.join("\n");
-  return { css, cssRules: rules.length - 1, nested, tabBlocks };
+  return { css, cssRules: rules.length - 1, nested, tabBlocks, movedBadges };
+}
+
+function toIconTheme(colors: ThemeColors) {
+  return {
+    colorScheme: colors.colorScheme ?? (colors.name === "light" ? ("light" as const) : ("dark" as const)),
+    foreground: colors.fg,
+    foregroundMuted: colors.muted,
+    surfaceSidebar: colors.surfaceSidebar ?? colors.hover,
+    surface1: colors.surface1 ?? colors.hover,
+    statusDotRunning: colors.running,
+    statusSuccess: colors.success ?? colors.running,
+    statusWarning: colors.warning,
+    statusDanger: colors.danger ?? colors.warning,
+  };
 }
 
 function renderTabBlock(
@@ -478,8 +591,10 @@ function renderTabBlock(
   block: RenderResult["tabBlocks"][number],
   expanded: Set<string>,
   activeAgentId: string | null,
+  colors: ThemeColors,
+  modelIconsMode: SubsessionModelIconMode,
   rerender: () => void,
-): boolean {
+): { shown: boolean; iconsRendered: number; crossModelCount: number } {
   const row = doc.querySelector(rowSelector(block.key));
   const host = row?.parentElement;
   const existing = doc.querySelector<HTMLElement>(
@@ -487,18 +602,49 @@ function renderTabBlock(
   );
   if (!row || !host) {
     existing?.remove();
-    return false;
+    return { shown: false, iconsRendered: 0, crossModelCount: 0 };
   }
   const isOpen = expanded.has(block.key);
   const visible = isOpen ? block.rows : block.rows.slice(0, TAB_ROWS_VISIBLE);
   const hidden = block.rows.length - visible.length;
   const now = Date.now();
+  const iconTheme = toIconTheme(colors);
+  let crossModelCount = 0;
+  let iconsRendered = 0;
+  block.rows.forEach((r) => {
+    const cmp = compareSessionBrands(
+      { provider: r.provider, model: r.model },
+      { provider: r.parentProvider, model: r.parentModel },
+    );
+    if (cmp.differsBrand || cmp.differsCompany) crossModelCount += 1;
+  });
+  visible.forEach((r) => {
+    const cmp = compareSessionBrands(
+      { provider: r.provider, model: r.model },
+      { provider: r.parentProvider, model: r.parentModel },
+    );
+    if (shouldShowModelBrandIcon(modelIconsMode, cmp)) iconsRendered += 1;
+  });
+
   const sig = JSON.stringify([
-    visible.map((r) => [r.agentId, r.title, r.state, r.depth, relativeAge(r.lastActivityMs, now)]),
+    visible.map((r) => [
+      r.agentId,
+      r.title,
+      r.state,
+      r.attentionReason ?? "",
+      r.depth,
+      r.provider ?? "",
+      r.model ?? "",
+      r.parentProvider ?? "",
+      r.parentModel ?? "",
+      relativeAge(r.lastActivityMs, now),
+    ]),
     hidden,
     isOpen,
     activeAgentId,
     block.hasMovedChildren,
+    colors.name,
+    modelIconsMode,
   ]);
   // Keep our block after the row (and after any other plugin block already placed there).
   let el = existing;
@@ -510,7 +656,9 @@ function renderTabBlock(
     el.setAttribute("role", "group");
     host.appendChild(el);
   }
-  if (el.getAttribute("data-sig") === sig) return true;
+  if (el.getAttribute("data-sig") === sig) {
+    return { shown: true, iconsRendered, crossModelCount };
+  }
   el.setAttribute("data-sig", sig);
   el.textContent = "";
 
@@ -542,17 +690,59 @@ function renderTabBlock(
     addRow(index, child.depth, (btn) => {
       btn.setAttribute("data-agent-id", child.agentId);
       btn.setAttribute("data-state", child.state);
-      btn.setAttribute("aria-current", child.agentId === activeAgentId ? "true" : "false");
-      btn.title = `${child.title}\nStarted by another session · #${child.agentId.slice(0, 8)}`;
-      const dot = doc.createElement("span");
-      dot.className = "pff-dot";
+      const isActive = child.agentId === activeAgentId;
+      btn.setAttribute("aria-current", isActive ? "true" : "false");
+      const comparison = compareSessionBrands(
+        { provider: child.provider, model: child.model },
+        { provider: child.parentProvider, model: child.parentModel },
+      );
+      if (comparison.child.brand !== "unknown") {
+        btn.setAttribute("data-brand", comparison.child.brand);
+        btn.setAttribute(
+          "data-brand-diff",
+          comparison.differsBrand || comparison.differsCompany ? "true" : "false",
+        );
+      }
+      const modelLine =
+        comparison.child.brand !== "unknown"
+          ? comparison.parent && (comparison.differsBrand || comparison.differsCompany)
+            ? `${comparison.child.summary} (parent: ${comparison.parent.summary})`
+            : comparison.child.summary
+          : "";
+      const metaParts = [modelLine, "Started by another session", `#${child.agentId.slice(0, 8)}`].filter(Boolean);
+      btn.title = `${child.title}\n${metaParts.join(" · ")}`;
+
+      const brandEl = createModelBrandIconElement({
+        doc,
+        comparison,
+        mode: modelIconsMode,
+        theme: iconTheme,
+        sizePx: 13,
+        statusPip:
+          child.state === "running"
+            ? "running"
+            : child.state === "attention"
+              ? child.attentionReason === "finished"
+                ? "finished"
+                : child.attentionReason === "error"
+                  ? "error"
+                  : "attention"
+              : "none",
+        pipCutoutBg: isActive ? colors.selected : iconTheme.surfaceSidebar,
+      });
+      const leading = brandEl ?? (() => {
+        const dot = doc.createElement("span");
+        dot.className = "pff-dot";
+        return dot;
+      })();
+
       const title = doc.createElement("span");
       title.className = "pff-title";
       title.textContent = child.title;
       const age = doc.createElement("span");
       age.className = "pff-age";
       age.textContent = relativeAge(child.lastActivityMs, now);
-      btn.append(dot, title, age);
+      btn.append(leading, title, age);
       btn.addEventListener("click", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
@@ -580,7 +770,76 @@ function renderTabBlock(
       });
     });
   }
-  return true;
+  return { shown: true, iconsRendered, crossModelCount };
+}
+
+function renderMovedWorkspaceBrandBadges(
+  doc: Document,
+  movedBadges: MovedWorkspaceBadgePlan[],
+  colors: ThemeColors,
+  modelIconsMode: SubsessionModelIconMode,
+): number {
+  const keep = new Set<string>();
+  let shownCount = 0;
+  const iconTheme = toIconTheme(colors);
+
+  movedBadges.forEach((item) => {
+    const comparison = compareSessionBrands(
+      { provider: item.row.provider, model: item.row.model },
+      { provider: item.row.parentProvider, model: item.row.parentModel },
+    );
+    const shouldBadge =
+      modelIconsMode !== "off" &&
+      shouldShowModelBrandIcon("different", comparison);
+    if (!shouldBadge) return;
+
+    const row = doc.querySelector(rowSelector(item.key));
+    const host = row?.parentElement;
+    if (!row || !host) return;
+
+    const sig = JSON.stringify([
+      item.key,
+      item.depth,
+      comparison.child.brand,
+      comparison.child.summary,
+      colors.name,
+      modelIconsMode,
+    ]);
+    let badge = doc.querySelector<HTMLElement>(
+      `[data-testid="${MOVED_BRAND_BADGE_TESTID}"][data-row-key=${cssString(item.key)}]`,
+    );
+    if (!badge || badge.parentElement !== host) {
+      badge?.remove();
+      badge = doc.createElement("span");
+      badge.setAttribute("data-testid", MOVED_BRAND_BADGE_TESTID);
+      badge.setAttribute("data-row-key", item.key);
+      badge.setAttribute("aria-hidden", "true");
+      host.appendChild(badge);
+    }
+    keep.add(item.key);
+    shownCount += 1;
+    if (badge.getAttribute("data-sig") === sig) return;
+
+    badge.setAttribute("data-sig", sig);
+    badge.setAttribute("data-brand", comparison.child.brand);
+    badge.title = comparison.child.summary;
+    badge.style.left = `${INDENT_PX * item.depth + 19}px`;
+    badge.textContent = "";
+    const icon = createModelBrandIconElement({
+      doc,
+      comparison,
+      mode: "always",
+      theme: iconTheme,
+      sizePx: 10,
+      alwaysEmphasize: true,
+    });
+    if (icon) badge.appendChild(icon);
+  });
+
+  doc.querySelectorAll(`[data-testid="${MOVED_BRAND_BADGE_TESTID}"]`).forEach((n) => {
+    if (!keep.has(n.getAttribute("data-row-key") ?? "")) n.remove();
+  });
+  return shownCount;
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +880,7 @@ export function installSidebarChildSessions(docOverride?: Document | null): Hand
   const clear = () => {
     doc.getElementById(STYLE_ID)?.remove();
     doc.querySelectorAll(`[data-testid="${TAB_BLOCK_TESTID}"]`).forEach((n) => n.remove());
+    doc.querySelectorAll(`[data-testid="${MOVED_BRAND_BADGE_TESTID}"]`).forEach((n) => n.remove());
   };
 
   const render = () => {
@@ -629,13 +889,28 @@ export function installSidebarChildSessions(docOverride?: Document | null): Hand
     if (disposed) return;
     const started = Date.now();
     const prefs = readSidebarChildSessionsPrefs();
+    const modelIconsMode = normalizeSubsessionModelIconMode(prefs.modelIcons);
     const store = findSessionStore(win);
     if (store && !unsubscribe && typeof store.subscribe === "function") {
       unsubscribe = store.subscribe(schedule);
     }
     if (!prefs.enabled) {
       clear();
-      publish({ prefs, installed: true, storeFound: Boolean(store), renderedAt: new Date().toISOString(), nested: [], tabRows: [], skipped: [], cssRules: 0, renderMs: Date.now() - started, suspendedList: null, nativeNavigation: hasNativeNavigation(win) });
+      publish({
+        prefs,
+        installed: true,
+        storeFound: Boolean(store),
+        renderedAt: new Date().toISOString(),
+        nested: [],
+        tabRows: [],
+        skipped: [],
+        cssRules: 0,
+        renderMs: Date.now() - started,
+        suspendedList: null,
+        nativeNavigation: hasNativeNavigation(win),
+        crossModelCount: 0,
+        modelIconsShown: 0,
+      });
       return;
     }
     const snapshots = snapshotSessionStore(store);
@@ -662,15 +937,29 @@ export function installSidebarChildSessions(docOverride?: Document | null): Hand
     if (style.textContent !== css) style.textContent = css;
     const keep = new Set<string>();
     const tabRows: SidebarChildSessionsStatus["tabRows"] = [];
-    for (const block of layout.tabBlocks) {
-      const shown = renderTabBlock(doc, win, block, expanded, activeAgentId, render);
-      if (shown) keep.add(block.key);
+    let modelIconsShown = 0;
+    let tabCrossModelCount = 0;
+    layout.tabBlocks.forEach((block) => {
+      const res = renderTabBlock(doc, win, block, expanded, activeAgentId, colors, modelIconsMode, render);
+      if (res.shown) {
+        keep.add(block.key);
+        modelIconsShown += res.iconsRendered;
+      }
+      tabCrossModelCount += res.crossModelCount;
       const ws = plans.find((p) => block.key.startsWith(`${p.serverId}:`));
-      tabRows.push({ workspaceId: block.workspaceId, title: ws?.titles.get(block.workspaceId) ?? block.workspaceId, count: block.rows.length, onScreen: shown });
-    }
+      tabRows.push({
+        workspaceId: block.workspaceId,
+        title: ws?.titles.get(block.workspaceId) ?? block.workspaceId,
+        count: block.rows.length,
+        onScreen: res.shown,
+        crossModelCount: res.crossModelCount,
+      });
+    });
     doc.querySelectorAll(`[data-testid="${TAB_BLOCK_TESTID}"]`).forEach((n) => {
       if (!keep.has(n.getAttribute("data-row-key") ?? "")) n.remove();
     });
+    modelIconsShown += renderMovedWorkspaceBrandBadges(doc, layout.movedBadges, colors, modelIconsMode);
+    const movedCrossModelCount = layout.nested.filter((n) => n.differsFromParent).length;
 
     publish({
       prefs,
@@ -684,6 +973,8 @@ export function installSidebarChildSessions(docOverride?: Document | null): Hand
       renderMs: Date.now() - started,
       suspendedList,
       nativeNavigation: hasNativeNavigation(win),
+      crossModelCount: tabCrossModelCount + movedCrossModelCount,
+      modelIconsShown,
     });
   };
 
@@ -691,7 +982,10 @@ export function installSidebarChildSessions(docOverride?: Document | null): Hand
     if (!timer && !disposed) timer = win.setTimeout(render, RENDER_THROTTLE_MS) as unknown as number;
   };
 
-  const isOwnBlock = (n: Node) => (n as Element).getAttribute?.("data-testid") === TAB_BLOCK_TESTID;
+  const isOwnBlock = (n: Node) => {
+    const tid = (n as Element).getAttribute?.("data-testid");
+    return tid === TAB_BLOCK_TESTID || tid === MOVED_BRAND_BADGE_TESTID;
+  };
   /** Streaming answers and typing mutate constantly and never change the sidebar. */
   const QUIET_REGIONS = '[data-testid="agent-timeline"],[data-testid="agent-composer"]';
   const touchesList = (m: MutationRecord) =>
@@ -711,7 +1005,13 @@ export function installSidebarChildSessions(docOverride?: Document | null): Hand
     // Our own tab rows mutate the sidebar too; skip those so a render cannot trigger itself.
     // Anything else, including a native row being removed, schedules a render.
     const foreign = relevant.some((m) => {
-      if ((m.target as Element).closest?.(`[data-testid="${TAB_BLOCK_TESTID}"]`)) return false;
+      if (
+        (m.target as Element).closest?.(
+          `[data-testid="${TAB_BLOCK_TESTID}"],[data-testid="${MOVED_BRAND_BADGE_TESTID}"]`,
+        )
+      ) {
+        return false;
+      }
       const touched = [...Array.from(m.addedNodes), ...Array.from(m.removedNodes)];
       return touched.length === 0 || !touched.every(isOwnBlock);
     });
@@ -786,7 +1086,10 @@ function publish(status: SidebarChildSessionsStatus): void {
     prev.tabRows.length !== status.tabRows.length ||
     prev.skipped.length !== status.skipped.length ||
     prev.prefs.enabled !== status.prefs.enabled ||
-    prev.prefs.tabChildren !== status.prefs.tabChildren;
+    prev.prefs.tabChildren !== status.prefs.tabChildren ||
+    prev.prefs.modelIcons !== status.prefs.modelIcons ||
+    prev.modelIconsShown !== status.modelIconsShown ||
+    prev.crossModelCount !== status.crossModelCount;
   if (changed && typeof window !== "undefined") {
     try {
       window.dispatchEvent(new CustomEvent(SIDEBAR_CHILD_SESSIONS_EVENT));
@@ -871,5 +1174,21 @@ export function runSidebarChildSessionsSelfTest(docOverride?: Document | null): 
     const shown = doc.querySelectorAll(`[data-testid="${TAB_BLOCK_TESTID}"] [data-testid="${TAB_ROW_TESTID}"]`).length > 0;
     checks.push({ name: `${t.title} (tabs)`, ok: !t.onScreen || shown, detail: t.onScreen ? `${t.count} tab sub-session(s) listed` : "workspace row not on screen" });
   }
+  const mode = normalizeSubsessionModelIconMode(status.prefs.modelIcons);
+  const renderedIcons = doc.querySelectorAll(
+    `[data-testid="${TAB_BLOCK_TESTID}"] [data-testid="${MODEL_BRAND_ICON_TESTID}"], [data-testid="${MOVED_BRAND_BADGE_TESTID}"] [data-testid="${MODEL_BRAND_ICON_TESTID}"]`,
+  ).length;
+  const visibleTabRows = doc.querySelectorAll(
+    `[data-testid="${TAB_BLOCK_TESTID}"] [data-testid="${TAB_ROW_TESTID}"][data-agent-id]`,
+  ).length;
+  const expectIcon = mode === "always" ? visibleTabRows > 0 : mode === "different" ? (status.crossModelCount ?? 0) > 0 && visibleTabRows > 0 : false;
+  checks.push({
+    name: "model-icons",
+    ok: mode === "off" ? renderedIcons === 0 : !expectIcon || renderedIcons > 0,
+    detail:
+      mode === "off"
+        ? `mode=off · ${renderedIcons} icon(s) rendered`
+        : `mode=${mode} · ${renderedIcons} brand icon(s) rendered · ${status.crossModelCount ?? 0} cross-model`,
+  });
   return checks;
 }

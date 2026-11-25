@@ -7,6 +7,12 @@ import {
   inspectSystemPromptRpc,
 } from "../shared/contracts";
 import { isChineseLocale } from "./i18n";
+import { compareSessionBrands } from "../shared/model-brand-icons";
+import {
+  SIDEBAR_CHILD_SESSIONS_EVENT_NAME,
+  createModelBrandIconElement,
+  readSubsessionModelIconMode,
+} from "./model-brand-icon-web";
 import { syncPaseoThemeCssVariables, resolveActivePaseoTheme } from "./theme-web";
 import { focusWorkspaceInApp, readQuickJumpPreferences } from "./web";
 import {
@@ -1524,20 +1530,30 @@ export function enhanceTimelineAgentMentions(
     const displayTitle = cleanSessionDisplayTitle(rawDisplayTitle) || short7;
     const shortPreview =
       displayTitle.length > 22 ? `${displayTitle.slice(0, 22)}\u2026` : displayTitle;
-    const pillSig = `${matched.agentId}:${matched.status}:${shortPreview}:${tokens.name}`;
+    const codeModelIconsMode = readSubsessionModelIconMode(w);
+    const codeBrandCmp = compareSessionBrands(
+      { provider: matched.provider, model: matched.model },
+      currentNode ? { provider: currentNode.provider, model: currentNode.model } : null,
+    );
+    const pillSig = `${matched.agentId}:${matched.status}:${matched.provider}:${matched.model}:${codeModelIconsMode}:${shortPreview}:${tokens.name}`;
 
     if (codeEl.getAttribute("data-vec-pill-sig") !== pillSig) {
       codeEl.setAttribute("data-vec-raw-token", rawToken);
       codeEl.setAttribute("data-vec-session-pill", matched.agentId);
       codeEl.setAttribute("data-vec-pill-sig", pillSig);
       codeEl.setAttribute("data-testid", `paseo-finder-inline-session-pill-${short7}`);
+      if (codeBrandCmp.child.brand !== "unknown") {
+        codeEl.setAttribute("data-brand", codeBrandCmp.child.brand);
+      }
       codeEl.setAttribute("role", "button");
       codeEl.tabIndex = 0;
       const projPart = matched.projectName ? ` \u00b7 ${matched.projectName}` : "";
+      const modelPart =
+        codeBrandCmp.child.brand !== "unknown" ? ` \u00b7 ${codeBrandCmp.child.summary}` : "";
       const statusLabel = statusWordFor(matched.status);
       codeEl.title = zh
-        ? `\u70b9\u51fb\u8df3\u8f6c\u81f3\u4f1a\u8bdd: ${displayTitle} (#${short7})${projPart} \u00b7 \u72b6\u6001: ${statusLabel}`
-        : `Click to jump to session: ${displayTitle} (#${short7})${projPart} \u00b7 Status: ${statusLabel}`;
+        ? `\u70b9\u51fb\u8df3\u8f6c\u81f3\u4f1a\u8bdd: ${displayTitle} (#${short7})${modelPart}${projPart} \u00b7 \u72b6\u6001: ${statusLabel}`
+        : `Click to jump to session: ${displayTitle} (#${short7})${modelPart}${projPart} \u00b7 Status: ${statusLabel}`;
 
       Object.assign(codeEl.style, {
         display: "inline-flex",
@@ -1556,7 +1572,26 @@ export function enhanceTimelineAgentMentions(
       });
 
       codeEl.innerHTML = "";
+      const normCodeStatus = (matched.status ?? "").toLowerCase();
+      const brandEl = createModelBrandIconElement({
+        doc: d,
+        comparison: codeBrandCmp,
+        mode: codeModelIconsMode,
+        theme: tokens,
+        sizePx: 12,
+        statusPip:
+          normCodeStatus === "running"
+            ? "running"
+            : normCodeStatus === "error" || normCodeStatus === "failed"
+              ? "error"
+              : normCodeStatus === "attention" || normCodeStatus === "waiting_permission"
+                ? "attention"
+                : "none",
+        pipCutoutBg: tokens.surface1,
+      });
+
       const dot = d.createElement("span");
+      dot.setAttribute("data-vec-session-pill-dot", "1");
       Object.assign(dot.style, {
         width: "5px",
         height: "5px",
@@ -1583,7 +1618,14 @@ export function enhanceTimelineAgentMentions(
         color: tokens.foregroundMuted,
       });
 
-      codeEl.appendChild(dot);
+      if (brandEl) {
+        brandEl.setAttribute("data-vec-session-pill-brand", "1");
+        dot.style.display = "none";
+        codeEl.appendChild(dot);
+        codeEl.appendChild(brandEl);
+      } else {
+        codeEl.appendChild(dot);
+      }
       codeEl.appendChild(idSpan);
       codeEl.appendChild(titleSpan);
     }
@@ -2530,27 +2572,30 @@ export function installDesktopSessionLineageEnhancer(
       hostParent.insertBefore(bar, composer);
     }
 
+    const modelIconsMode = readSubsessionModelIconMode(window);
     const sig = JSON.stringify({
       cur: current?.agentId ?? curAgentId,
+      curBrand: `${current?.provider ?? ""}:${current?.model ?? ""}`,
       ret: returnBreadcrumb
-        ? `${returnBreadcrumb.agentId}:${displayLabelFor(returnBreadcrumb)}`
+        ? `${returnBreadcrumb.agentId}:${returnBreadcrumb.provider}:${returnBreadcrumb.model}:${displayLabelFor(returnBreadcrumb)}`
         : null,
       par: data.parent?.agentId,
-      parTitle: data.parent ? displayLabelFor(data.parent) : null,
+      parTitle: data.parent ? `${data.parent.provider}:${data.parent.model}:${displayLabelFor(data.parent)}` : null,
       orig: data.routedOrigin?.agentId,
-      origTitle: data.routedOrigin ? displayLabelFor(data.routedOrigin) : null,
+      origTitle: data.routedOrigin ? `${data.routedOrigin.provider}:${data.routedOrigin.model}:${displayLabelFor(data.routedOrigin)}` : null,
       chCount: children.length,
-      chIds: children.slice(0, 6).map((c) => `${c.shortId}:${c.status}:${displayLabelFor(c)}`),
+      chIds: children.slice(0, 6).map((c) => `${c.shortId}:${c.status}:${c.provider}:${c.model}:${displayLabelFor(c)}`),
       colCount: colleagues.length,
-      colIds: colleagues.slice(0, 6).map((c) => `${c.shortId}:${c.status}:${displayLabelFor(c)}`),
+      colIds: colleagues.slice(0, 6).map((c) => `${c.shortId}:${c.status}:${c.provider}:${c.model}:${displayLabelFor(c)}`),
       refCount: uniqueReferencedPeers.length,
       refIds: uniqueReferencedPeers
         .slice(0, 6)
-        .map((p) => `${p.shortId}:${p.status}:${displayLabelFor(p)}`),
+        .map((p) => `${p.shortId}:${p.status}:${p.provider}:${p.model}:${displayLabelFor(p)}`),
       sibCount: siblings.length,
       brief: current?.briefPath,
       report: current?.reportExists,
       open: activePopoverSection,
+      modelIconsMode,
       zh,
       theme: tokens.name,
     });
@@ -2617,6 +2662,42 @@ export function installDesktopSessionLineageEnhancer(
       return dot;
     };
 
+    const nodeModelSuffix = (node: SessionLineageNode): string => {
+      const cmp = compareSessionBrands(
+        { provider: node.provider, model: node.model },
+        current ? { provider: current.provider, model: current.model } : null,
+      );
+      return cmp.child.brand !== "unknown" ? ` · ${cmp.child.summary}` : "";
+    };
+
+    const createNodeLeading = (
+      node: SessionLineageNode,
+      cutoutBg = tokens.surface1,
+    ): HTMLElement => {
+      const cmp = compareSessionBrands(
+        { provider: node.provider, model: node.model },
+        current ? { provider: current.provider, model: current.model } : null,
+      );
+      const normStatus = (node.status ?? "").toLowerCase();
+      const brandEl = createModelBrandIconElement({
+        doc: document,
+        comparison: cmp,
+        mode: modelIconsMode,
+        theme: tokens,
+        sizePx: 12,
+        statusPip:
+          normStatus === "running"
+            ? "running"
+            : normStatus === "error" || normStatus === "failed"
+              ? "error"
+              : normStatus === "attention" || normStatus === "waiting_permission"
+                ? "attention"
+                : "none",
+        pipCutoutBg: cutoutBg,
+      });
+      return brandEl ?? createDot(node.status);
+    };
+
     const topRow = document.createElement("div");
     Object.assign(topRow.style, {
       display: "flex",
@@ -2654,7 +2735,7 @@ export function installDesktopSessionLineageEnhancer(
         ? `↩ 返回 · ${truncatedReturnTitle}`
         : `↩ Back · ${truncatedReturnTitle}`;
 
-      returnBtn.appendChild(createDot(returnBreadcrumb.status));
+      returnBtn.appendChild(createNodeLeading(returnBreadcrumb, tokens.surface2));
       returnBtn.appendChild(textSpan);
       styleTrackPill(returnBtn, { active: true, accentBorder: true });
 
@@ -2697,7 +2778,7 @@ export function installDesktopSessionLineageEnhancer(
         ? `↖ 父会话 · ${truncatedParentTitle}`
         : `↖ Parent · ${truncatedParentTitle}`;
 
-      parentBtn.appendChild(createDot(parentNode.status));
+      parentBtn.appendChild(createNodeLeading(parentNode, tokens.surface2));
       parentBtn.appendChild(textSpan);
       styleTrackPill(parentBtn, { active: true });
 
@@ -2735,7 +2816,7 @@ export function installDesktopSessionLineageEnhancer(
         ? `${isIntakeOrigin ? "派发自" : "协作"} · ${truncatedOriginTitle} ↗`
         : `${isIntakeOrigin ? "Routed from" : "Colleague"} · ${truncatedOriginTitle} ↗`;
 
-      originBtn.appendChild(createDot(originNode.status));
+      originBtn.appendChild(createNodeLeading(originNode, tokens.surface1));
       originBtn.appendChild(textSpan);
       styleTrackPill(originBtn);
 
@@ -2767,9 +2848,9 @@ export function installDesktopSessionLineageEnhancer(
             : childDisplay;
         const chipLabel = document.createElement("span");
         chipLabel.textContent = `${zh ? "子会话" : "Subagent"} · ${shortTitle} · ${childStatusWord} ↗`;
-        chip.appendChild(createDot(child.status));
+        chip.appendChild(createNodeLeading(child, tokens.surface1));
         chip.appendChild(chipLabel);
-        chip.title = `${childDisplay} · #${child.shortId} · ${childStatusWord}`;
+        chip.title = `${childDisplay} · #${child.shortId}${nodeModelSuffix(child)} · ${childStatusWord}`;
         styleTrackPill(chip);
         chip.addEventListener("click", (ev) => {
           ev.preventDefault();
@@ -2827,13 +2908,13 @@ export function installDesktopSessionLineageEnhancer(
           ? `${colDisplay.slice(0, 28)}\u2026`
           : colDisplay;
       colChip.title = zh
-        ? `跨会话协作同伴 · 点击跳转: ${colDisplay} · #${col.shortId}`
-        : `Collaborating peer session · Click to jump: ${colDisplay} · #${col.shortId}`;
+        ? `跨会话协作同伴 · 点击跳转: ${colDisplay} · #${col.shortId}${nodeModelSuffix(col)}`
+        : `Collaborating peer session · Click to jump: ${colDisplay} · #${col.shortId}${nodeModelSuffix(col)}`;
       const textSpan = document.createElement("span");
       textSpan.textContent = zh
         ? `协作 · ${shortColTitle} ↗`
         : `Colleague · ${shortColTitle} ↗`;
-      colChip.appendChild(createDot(col.status));
+      colChip.appendChild(createNodeLeading(col, tokens.surface1));
       colChip.appendChild(textSpan);
       styleTrackPill(colChip);
       colChip.addEventListener("click", (ev) => {
@@ -2892,7 +2973,7 @@ export function installDesktopSessionLineageEnhancer(
         textSpan.textContent = zh
           ? `引用 · ${shortPeerTitle} ↗`
           : `Referenced · ${shortPeerTitle} ↗`;
-        peerChip.appendChild(createDot(peer.status));
+        peerChip.appendChild(createNodeLeading(peer, tokens.surface1));
         peerChip.appendChild(textSpan);
         styleTrackPill(peerChip);
         peerChip.addEventListener("click", (ev) => {
@@ -3098,8 +3179,12 @@ export function installDesktopSessionLineageEnhancer(
           fontWeight: "500",
         });
 
-        itemLeft.appendChild(createDot(itemNode.status));
+        itemLeft.appendChild(createNodeLeading(itemNode, tokens.surface0));
         itemLeft.appendChild(titleSpan);
+        const itemModelTag = nodeModelSuffix(itemNode);
+        if (itemModelTag) {
+          itemBtn.title = `${displayLabelFor(itemNode)} · #${itemNode.shortId}${itemModelTag}`;
+        }
 
         const metaSpan = document.createElement("span");
         metaSpan.textContent = `#${itemNode.shortId} · ${formatNodeStatusWord(itemNode.status, zh)} ↗`;
@@ -3226,8 +3311,16 @@ export function installDesktopSessionLineageEnhancer(
     }
   };
 
+  const onModelIconPrefsChange = () => {
+    syncLineageForCurrentRoute(true);
+    const { workspaceId, agentId } = extractCurrentWorkspaceAndAgent(document, window);
+    const cached = cacheByKey.get(`${workspaceId ?? ""}:${agentId ?? ""}`)?.data;
+    enhanceTimelineAgentMentions(cached ?? null, document, window);
+  };
+
   window.addEventListener("keydown", onKeyDown, true);
   window.addEventListener("popstate", () => syncLineageForCurrentRoute(true), false);
+  window.addEventListener(SIDEBAR_CHILD_SESSIONS_EVENT_NAME, onModelIconPrefsChange);
   setTimeout(() => syncLineageForCurrentRoute(true), 120);
 
   return () => {
@@ -3238,6 +3331,7 @@ export function installDesktopSessionLineageEnhancer(
     if (pollId) clearInterval(pollId);
     if (rafId !== null) window.cancelAnimationFrame(rafId);
     window.removeEventListener("keydown", onKeyDown, true);
+    window.removeEventListener(SIDEBAR_CHILD_SESSIONS_EVENT_NAME, onModelIconPrefsChange);
     document
       .querySelector('[data-testid="paseo-finder-session-lineage-bar"]')
       ?.remove();
