@@ -127,6 +127,10 @@ import {
   syncSidebarDefaultCollapsePrefs,
 } from "./sidebar-default-collapse-web";
 import {
+  DEFAULT_SUBSESSION_MODEL_ICON_MODE,
+  normalizeSubsessionModelIconMode,
+} from "../shared/model-brand-icons";
+import {
   SIDEBAR_CHILD_SESSIONS_EVENT,
   type SidebarChildSessionsCheck,
   type SidebarChildSessionsStatus,
@@ -3082,11 +3086,28 @@ export function FinderPluginSettingsScreen({ theme, layout }: PluginSurfaceProps
             setSidebarChildChecks(null);
           }}
         />
+        <SettingsSelect
+          label={t("settings.sidebarChildModelIconsLabel")}
+          hint={t("settings.sidebarChildModelIconsHint")}
+          value={normalizeSubsessionModelIconMode(sidebarChildStatus?.prefs.modelIcons)}
+          options={[
+            { label: t("settings.sidebarChildModelIconsAlways"), value: "always" },
+            { label: t("settings.sidebarChildModelIconsDifferent"), value: "different" },
+            { label: t("settings.sidebarChildModelIconsOff"), value: "off" },
+          ]}
+          onValueChange={(next) => {
+            syncSidebarChildSessionsPrefs({
+              modelIcons: normalizeSubsessionModelIconMode(next),
+            });
+            setSidebarChildStatus(getSidebarChildSessionsStatus());
+            setSidebarChildChecks(null);
+          }}
+        />
         <View style={styles.diagBox}>
           <Text style={styles.label}>
             {t("settings.sidebarChildStatusPrefix")}{" "}
             {sidebarChildStatus
-              ? `${sidebarChildStatus.prefs.enabled ? "on" : "off"} · store=${sidebarChildStatus.storeFound ? "found" : "missing"} · nested workspaces=${sidebarChildStatus.nested.length} · tab sub-sessions=${sidebarChildStatus.tabRows.reduce((n, r) => n + r.count, 0)} · kept at top=${sidebarChildStatus.skipped.length} · render ${sidebarChildStatus.renderMs} ms`
+              ? `${sidebarChildStatus.prefs.enabled ? "on" : "off"} · store=${sidebarChildStatus.storeFound ? "found" : "missing"} · nested workspaces=${sidebarChildStatus.nested.length} · tab sub-sessions=${sidebarChildStatus.tabRows.reduce((n, r) => n + r.count, 0)} · model icons=${normalizeSubsessionModelIconMode(sidebarChildStatus.prefs.modelIcons)} (${sidebarChildStatus.modelIconsShown ?? 0} shown · ${sidebarChildStatus.crossModelCount ?? 0} cross-model) · kept at top=${sidebarChildStatus.skipped.length} · render ${sidebarChildStatus.renderMs} ms`
               : "-"}
           </Text>
           <View style={styles.row}>
@@ -3098,6 +3119,20 @@ export function FinderPluginSettingsScreen({ theme, layout }: PluginSurfaceProps
               }}
             >
               <Text style={styles.btnText}>{t("settings.sidebarChildSelfTestBtn")}</Text>
+            </Pressable>
+            <Pressable
+              style={styles.btn}
+              onPress={() => {
+                syncSidebarChildSessionsPrefs({
+                  enabled: true,
+                  tabChildren: true,
+                  modelIcons: DEFAULT_SUBSESSION_MODEL_ICON_MODE,
+                });
+                setSidebarChildStatus(getSidebarChildSessionsStatus());
+                setSidebarChildChecks(null);
+              }}
+            >
+              <Text style={styles.btnText}>{t("settings.sidebarChildResetBtn")}</Text>
             </Pressable>
           </View>
           {sidebarChildChecks
@@ -3112,6 +3147,7 @@ export function FinderPluginSettingsScreen({ theme, layout }: PluginSurfaceProps
             sidebarChildStatus.nested.slice(0, 12).map((n) => (
               <Text key={`nested-${n.workspaceId}`} style={styles.detail}>
                 • {n.title} ← {n.parentTitle}
+                {n.modelSummary ? ` · ${n.modelSummary}${n.differsFromParent ? " *" : ""}` : ""}
                 {n.onScreen ? "" : " (not on screen)"}
               </Text>
             ))

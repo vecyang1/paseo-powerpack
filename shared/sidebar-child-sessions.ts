@@ -39,9 +39,14 @@ export interface ChildSessionAgent {
   /** `turn.phase === "open"` in the store. */
   running?: boolean;
   requiresAttention?: boolean;
+  attentionReason?: "finished" | "error" | "permission" | string | null;
   pendingPermissionCount?: number;
   createdAt?: string | number | Date | null;
   lastActivityAt?: string | number | Date | null;
+  /** Provider harness slug (e.g. `claude`, `antigravity`, `codex`). */
+  provider?: string | null;
+  /** Active or configured model ID (e.g. `claude-opus-5-5`, `gemini-4-neon`). */
+  model?: string | null;
 }
 
 export type ChildSessionSkipReason =
@@ -61,7 +66,12 @@ export interface TabChildRow {
   depth: number;
   title: string;
   state: "running" | "attention" | "idle";
+  attentionReason?: "finished" | "error" | "permission" | null;
   lastActivityMs: number | null;
+  provider?: string | null;
+  model?: string | null;
+  parentProvider?: string | null;
+  parentModel?: string | null;
 }
 
 export interface ChildWorkspaceLink {
@@ -69,6 +79,8 @@ export interface ChildWorkspaceLink {
   parentWorkspaceId: string;
   /** Agents in the child workspace and the parent agent each one names. */
   links: Array<{ agentId: string; parentAgentId: string }>;
+  /** Normalized metadata rows for moved workspace badges and diagnostics. */
+  linkRows?: TabChildRow[];
 }
 
 export interface ChildSessionSkip {
@@ -123,6 +135,15 @@ function agentState(agent: ChildSessionAgent): TabChildRow["state"] {
   if (agent.requiresAttention || (agent.pendingPermissionCount ?? 0) > 0) return "attention";
   if (agent.running || clean(agent.status).toLowerCase() === "running") return "running";
   return "idle";
+}
+
+function agentAttentionReason(
+  agent: ChildSessionAgent,
+): TabChildRow["attentionReason"] {
+  if ((agent.pendingPermissionCount ?? 0) > 0) return "permission";
+  const r = clean(agent.attentionReason).toLowerCase();
+  if (r === "finished" || r === "error" || r === "permission") return r;
+  return null;
 }
 
 function byCreated(a: ChildSessionAgent, b: ChildSessionAgent): number {
@@ -196,6 +217,7 @@ export function planChildSessions(
           continue;
         }
         seen.add(kid.id);
+        const parentAgent = live.get(parentId);
         rows.push({
           agentId: kid.id,
           parentAgentId: parentId,
@@ -203,7 +225,12 @@ export function planChildSessions(
           depth: Math.min(depth, MAX_NEST_DEPTH),
           title: clean(kid.title) || kid.id.slice(0, 8),
           state: agentState(kid),
+          attentionReason: agentAttentionReason(kid),
           lastActivityMs: toMs(kid.lastActivityAt) ?? toMs(kid.createdAt),
+          provider: clean(kid.provider) || null,
+          model: clean(kid.model) || null,
+          parentProvider: clean(parentAgent?.provider) || null,
+          parentModel: clean(parentAgent?.model) || null,
         });
         walk(kid.id, depth + 1);
       }
@@ -234,10 +261,28 @@ export function planChildSessions(
     }
     const [parentWorkspaceId] = [...parentWs];
     if (!parentWorkspaceId || parentWorkspaceId === wsId) continue;
+    const ordered = linked.sort(byCreated);
     childWorkspaces.set(wsId, {
       workspaceId: wsId,
       parentWorkspaceId,
-      links: linked.sort(byCreated).map((r) => ({ agentId: r.id, parentAgentId: parentOf.get(r.id)!.id })),
+      links: ordered.map((r) => ({ agentId: r.id, parentAgentId: parentOf.get(r.id)!.id })),
+      linkRows: ordered.map((r) => {
+        const parentAgent = parentOf.get(r.id)!;
+        return {
+          agentId: r.id,
+          parentAgentId: parentAgent.id,
+          workspaceId: wsId,
+          depth: 1,
+          title: clean(r.title) || r.id.slice(0, 8),
+          state: agentState(r),
+          attentionReason: agentAttentionReason(r),
+          lastActivityMs: toMs(r.lastActivityAt) ?? toMs(r.createdAt),
+          provider: clean(r.provider) || null,
+          model: clean(r.model) || null,
+          parentProvider: clean(parentAgent.provider) || null,
+          parentModel: clean(parentAgent.model) || null,
+        };
+      }),
     });
   }
   // A workspace chain that loops back on itself would hide rows forever; drop every member.

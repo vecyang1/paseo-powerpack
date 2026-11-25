@@ -253,3 +253,40 @@ test("tab sub-sessions are offered for their workspace row unless turned off", (
   const off = planSidebarLayout(doc, [{ serverId: SERVER, plan, titles: new Map() }], colors, { enabled: true, tabChildren: false });
   assert.equal(off.tabBlocks.length, 0);
 });
+
+test("provider and model metadata propagate from parent and child into tab rows and moved badges", () => {
+  const plan = planChildSessions(
+    [
+      agent("p1", "wks_P", { provider: "antigravity", model: "gemini-4-neon" }),
+      agent("t2", "wks_P", {
+        ...childOf("p1"),
+        provider: "claude",
+        model: "claude-opus-5-5",
+      }),
+      agent("c3", "wks_C", {
+        ...childOf("p1"),
+        provider: "claude",
+        model: "claude-opus-5-5",
+      }),
+    ],
+    { serverId: SERVER },
+  );
+  const tabRow = plan.tabChildren.get("wks_P")?.[0];
+  assert.ok(tabRow);
+  assert.equal(tabRow.provider, "claude");
+  assert.equal(tabRow.model, "claude-opus-5-5");
+  assert.equal(tabRow.parentProvider, "antigravity");
+  assert.equal(tabRow.parentModel, "gemini-4-neon");
+
+  const doc = fakeSidebar("sidebar-workspace-list-proj", ["srv_A:wks_C", "srv_A:wks_P"]);
+  const out = planSidebarLayout(doc, [{ serverId: SERVER, plan, titles: new Map() }], colors, {
+    enabled: true,
+    tabChildren: true,
+    modelIcons: "always",
+  });
+  assert.equal(out.nested[0]?.brand, "claude");
+  assert.equal(out.nested[0]?.modelSummary, "Claude · Opus 5.5");
+  assert.equal(out.nested[0]?.differsFromParent, true);
+  assert.equal(out.movedBadges.length, 1);
+  assert.equal(out.movedBadges[0]?.workspaceId, "wks_C");
+});

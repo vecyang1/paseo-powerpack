@@ -359,6 +359,13 @@ export const enMessages = {
     sidebarChildTabsLabel: "Also list sub-sessions that run as tabs",
     sidebarChildTabsHint:
       "A sub-session in its parent's workspace is otherwise only a tab. With this on it gets a row under the workspace; click it to open the tab.",
+    sidebarChildModelIconsLabel: "Model icon on sub-sessions",
+    sidebarChildModelIconsHint:
+      "Show the model company mark on sub-session rows, colleague pills, and cross-model Swarm workers.",
+    sidebarChildModelIconsAlways: "Show all (highlight different)",
+    sidebarChildModelIconsDifferent: "Only when different from parent",
+    sidebarChildModelIconsOff: "Off",
+    sidebarChildResetBtn: "Restore defaults",
     sidebarChildStatusPrefix: "Sub-sessions:",
     sidebarChildSelfTestBtn: "Check placement",
     sidebarChildNestedTitle: "Nested workspaces",
@@ -818,6 +825,13 @@ export const zhMessages: PluginMessageCatalog = {
       "由另一个会话发起的会话（agent 调用 create_agent 或 paseo run）会移到父会话那一行下面，和 Claude 桌面版一样。父会话归档后，它回到顶层。键盘顺序和拖动排序仍按 Paseo 自己的顺序。",
     sidebarChildTabsLabel: "也列出以标签页运行的子会话",
     sidebarChildTabsHint: "和父会话在同一工作区的子会话原本只是一个标签页。打开后它在工作区下面有一行，点击即打开该标签页。",
+    sidebarChildModelIconsLabel: "子会话模型图标",
+    sidebarChildModelIconsHint:
+      "在侧边栏子会话、协作同伴胶囊与跨模型 Swarm 成员行上显示模型厂商小图标。",
+    sidebarChildModelIconsAlways: "全部显示并突出跨模型",
+    sidebarChildModelIconsDifferent: "仅与父会话不同模型时显示",
+    sidebarChildModelIconsOff: "关闭",
+    sidebarChildResetBtn: "恢复默认",
     sidebarChildStatusPrefix: "子会话：",
     sidebarChildSelfTestBtn: "检查位置",
     sidebarChildNestedTitle: "已嵌套的工作区",
