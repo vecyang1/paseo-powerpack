@@ -111,6 +111,11 @@ import {
   triggerJumpToParentSession,
   triggerReconcileSidebarWorkspaceTitles,
 } from "./client/session-lineage-web";
+import { manageMultiModelRaceRpc } from "./shared/multi-model-race-contracts";
+import {
+  installMultiModelRaceEnhancer,
+  openMultiModelRaceModal,
+} from "./client/multi-model-race-web";
 import { ForkSessionPopover } from "./client/fork-session";
 import { forkSessionRpc } from "./shared/contracts";
 import {
@@ -2085,6 +2090,44 @@ export default function contribute(client: PluginClientContext) {
     getLocale: () => client.i18n.locale,
   });
 
+  const openRaceWorkspaceById = (wsId: string) => {
+    const win = getWebWindow() as Window | null;
+    if (!win || !wsId) return;
+    const row = win.document?.querySelector<HTMLElement>(
+      `[data-testid="sidebar-workspace-row-${wsId}"]`,
+    );
+    if (row) {
+      row.click();
+      return;
+    }
+    try {
+      const m = win.location.pathname.match(/^(\/host\/[^/]+)/);
+      const nextPath = m ? `${m[1]}/workspace/${encodeURIComponent(wsId)}` : `/workspace/${encodeURIComponent(wsId)}`;
+      win.history.pushState({}, "", nextPath);
+      win.dispatchEvent(new PopStateEvent("popstate"));
+    } catch {
+      // ignore navigation fallback
+    }
+  };
+
+  const raceModalOptions = {
+    call: (
+      input: Parameters<typeof openMultiModelRaceModal>[0]["call"] extends (arg: infer I) => unknown
+        ? I
+        : never,
+    ) => client.rpc(manageMultiModelRaceRpc, input),
+    getLocale: () => client.i18n.locale,
+    showToast: (msg: string, opts?: { variant?: "info" | "success" | "error" }) => {
+      const win = getWebWindow();
+      const doc = win?.document ?? null;
+      if (doc && win) showFinderNoticeToast(doc, win, msg, opts?.variant === "error");
+    },
+    openWorkspace: openRaceWorkspaceById,
+    win: getWebWindow() as Window | null,
+  };
+
+  const cleanupMultiModelRaceEnhancer = installMultiModelRaceEnhancer(raceModalOptions);
+
   const cleanupDocPreviewEnhancer = installDesktopDocPreviewEnhancer({
     getLocale: () => client.i18n.locale,
   });
@@ -2420,6 +2463,41 @@ export default function contribute(client: PluginClientContext) {
     },
   });
 
+  client.addCommandCenterItem({
+    id: "multi-model-race",
+    title: "Finder: Multi-Model Parallel Worktree Race (⇧⌘M)",
+    icon: "GitFork",
+    keywords: [
+      "race",
+      "multi-model",
+      "parallel",
+      "worktree",
+      "compare",
+      "fan-out",
+      "赛马",
+      "多模型",
+      "并行",
+    ],
+    context: "global",
+    onSelect() {
+      void openMultiModelRaceModal(raceModalOptions);
+    },
+  });
+
+  client.addSlashCommand({
+    name: "race",
+    description: "Launch 1 prompt across 2+ models/profiles in parallel isolated worktrees",
+    argumentHint: "[prompt]",
+    context: "workspace",
+    onSubmit({ args, workspace }) {
+      void openMultiModelRaceModal(raceModalOptions, {
+        initialPrompt: args.trim(),
+        initialCwd: workspace.directory ?? undefined,
+        initialWorkspaceId: workspace.id,
+      });
+    },
+  });
+
   return () => {
     lifetime.abort();
     if (syncProjectsTimer) {
@@ -2444,6 +2522,7 @@ export default function contribute(client: PluginClientContext) {
     cleanupSessionRefText();
     cleanupSubagentsTreeEnhancer();
     cleanupSessionLineageEnhancer();
+    cleanupMultiModelRaceEnhancer();
     cleanupDocPreviewEnhancer();
     cleanupCompactionAndContextEnhancer();
     cleanupIntakeDecisionsEnhancer();
